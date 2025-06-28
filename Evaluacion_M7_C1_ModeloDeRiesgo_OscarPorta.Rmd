@@ -1,0 +1,3232 @@
+---
+title: |
+ <b><div style="text-align: center"> Evaluación Practica Modelo de Riesgo − Seguro de Autos </div></b>
+author:  
+ name: Óscar Porta
+date: Mayo 2025
+output: 
+  rmdformats::readthedown:
+    code_folding: hide
+css: customOPS_med_green.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  fig.align = 'center',
+  fig.width = 12,   # ancho base (pulgadas)
+  fig.height = 5,   # alto base (pulgadas)
+  out.width  = '100%',
+  out.height = '80%'
+)
+# Fija el mirror de CRAN para toda la sesión ―imprescindible en modo no interactivo
+options(repos = c(CRAN = "https://cran.r-project.org"))
+```
+
+# 1. Introducción
+
+En este documento desarrollamos, paso a paso, el modelo de riesgo para la cobertura de Daños Materiales a terceros en un seguro de autos. Partiendo de los datos brutos entregados por el equipo de Data Engineering —que, por limitaciones de tiempo, requieren un proceso de limpieza y preparación específico—, llevamos a cabo un análisis exploratorio exhaustivo, ajustamos un modelo de Frecuencia y otro de Severidad mediante técnicas de regresión GLM, y combinamos ambos para obtener la Prima Pura por póliza.
+
+Nuestro objetivo es garantizar que cada variable incluyera en los modelos aporte un comportamiento coherente con la experiencia de negocio: desde la antigüedad del carné y el perfil crediticio del asegurado hasta las características técnicas y de uso del vehículo. Asimismo, dedicamos especial atención a la validación y la estabilidad de las tendencias marginales, asegurando que los resultados sean interpretables y estén alineados con las necesidades de Pricing & Analytics de la entidad.
+
+---
+
+## 1.1 Cálculo de la Prima pura
+
+Para calcular la prima pura de cada póliza partimos de los dos modelos calibrados (Frecuencia y Severidad). Primero aplicamos a toda la base de datos las mismas rutinas de preprocesado y recodificaciones que usamos en el entrenamiento (niveles de factores, polinomios, offsets, etc.), de modo que los datos “futuros” queden en el formato exacto que espera cada modelo. Luego pasamos esos datos transformados a nuestro GLM de Frecuencia para obtener la frecuencia media de siniestros, y al GLM de Severidad para estimar el coste medio por siniestro. Por último, multiplicamos ambas predicciones para obtener, póliza a póliza, la prima pura —es decir, la pérdida esperada por la aseguradora sin incluir gastos ni márgenes comerciales—.
+
+
+Para cada póliza \(i\):
+
+$$
+frecuencia \ siniestral = \frac{numero \ de \ reclamaciones}{exposicion}
+$$
+
+$$
+severidad \ media = \frac{cuantia \ total \ de \ las \ reclamaciones }{numero \ de \ reclamaciones}
+$$
+
+
+$$
+\boxed{prima \ pura = frecuencia \ siniestral \ media * severidad \ media}
+$$
+**Best practice (GLM)**  
+
+| Componente | Distribución | Link |
+|------------|--------------|------|
+| Frecuencia | Poisson      | Log  |
+| Severidad  | Gamma        | Log  |
+
+---
+
+## 1.2 Paquetes utilizados
+
+A continuación se enumeran y describen brevemente los paquetes de R empleados:
+
+* **data.table**: Librería para la importación y exportación de datos en csv de forma muy rápida. 
+
+* **tidyverse**: Librería que incluye varias sub-librerías para el manejo cómodo, ordenado y limpios de datos, entre ellas **dplyr**, **tidyr**, **stringr** o **ggplot2**.
+
+* **reactable**: Librería para la creación de tablas interactivas y editables con múltiples funcionalidades.
+
+* **rcompanion**: Librería que se empleará para extraer los resultado de la V de Cramer.
+
+* **creditmodel**: Librería complementaria para el análisis de la V de Cramer.
+
+* **writexl**: Librería para exportar a formato excel, se usa para exportar algún resultado que tiene cierto coste computacional.
+
+* **readxl**: Librería para importar desde formato excel, se usa para exportar algún resultado que tiene cierto coste computacional.
+
+* **corrplot**: Librería calcular las correlaciones.
+
+* **RColorBrewer**: Librería graficar las correlaciones con colores.
+
+* **rlang**: Librería para nombrar variables de forma dinámica.
+
+* **gridExtra**: Librería para mostrar varios gráficos juntos.
+
+
+Se instalan y/o cargan los paquetes necesarios y se fijan las opciones de R para la sesión.
+
+```{r Pack&Opt, message=FALSE, warning=FALSE}
+# Función para cargar los paquetes y previamente instalar los no existentes
+enable_packages <- function(x){
+  for( i in x ){
+    if( ! require( i , character.only = TRUE ) ){
+      install.packages( i , dependencies = TRUE )
+      require( i , character.only = TRUE )
+    }
+  }
+}
+
+# Paquetes
+enable_packages(c("data.table", "tidyverse", "reactable", "rcompanion", "creditmodel", "writexl", "readxl", "corrplot", "RColorBrewer","rlang", "gridExtra"))
+
+# Quitamos notación científica
+options(scipen = 999)
+
+# Semilla aleatoria para mostrar aleatoriamente muestras de los datos
+set.seed(123)
+```
+
+## 1.3 Funciones auxiliares
+
+Se recopilan a continuación una serie de funciones auxiliares para facilitar el tratamiento y visualización de los datos, incluyendo una pequeña descripción. 
+
+```{r funcAux, message=FALSE, warning=FALSE}
+# ──────────────────────────────────
+#  Funciones auxiliares  ·  Estilo 
+# ──────────────────────────────────
+
+## reactViewTableTarget
+##  · librería: reactable
+##  · objetivo : tabla interactiva resaltando columnas-target
+reactViewTableTarget <- function(data, vecTargetVar){
+
+  # Estilo para las columnas-target
+  coldefsTargets <- list(
+    colDef(
+      headerStyle = "background: #FE6F5E; color: white;",
+      style       = "background: #FFF4F0;",
+      class       = "border-left"
+    )
+  )
+  coldefsTargets <- rep(coldefsTargets, length(vecTargetVar))
+  names(coldefsTargets) <- vecTargetVar
+
+  data %>% reactable(
+    bordered             = TRUE,
+    filterable           = FALSE,
+    resizable            = TRUE,
+    searchable           = TRUE,
+    showPageSizeOptions  = TRUE,
+    defaultPageSize      = 10,
+    pageSizeOptions      = c(5, 10, 20, 50, 100),
+    borderless           = FALSE,
+    highlight            = TRUE,
+    outlined             = TRUE,
+    showSortIcon         = TRUE,
+    showSortable         = TRUE,
+    width                = "100%",
+    defaultColDef = colDef(
+      align        = "center",
+      headerStyle  = "background: #2B7A78; color: white;",
+      style        = "background: #DEF2F1;",
+      cell = function(value) {
+        if (!is.na(value) && is.numeric(value)) {
+          if (value %% 1 == 0) {
+            as.integer(value)
+          } else {
+            format(round(value, 2), nsmall = 2)
+          }
+        } else {
+          value
+        }
+      }
+    ),
+    columns = coldefsTargets
+  )
+}
+
+## reactViewTable
+##  · librería: reactable
+##  · objetivo : tabla interactiva estándar
+reactViewTable <- function(data){
+
+  data %>% reactable(
+    bordered             = TRUE,
+    filterable           = FALSE,
+    resizable            = TRUE,
+    searchable           = TRUE,
+    showPageSizeOptions  = TRUE,
+    defaultPageSize      = 10,
+    pageSizeOptions      = c(5, 10, 20, 50, 100),
+    borderless           = FALSE,
+    highlight            = TRUE,
+    outlined             = TRUE,
+    showSortIcon         = TRUE,
+    showSortable         = TRUE,
+    width                = "100%",
+    defaultColDef = colDef(
+      align        = "center",
+      headerStyle  = "background: #2B7A78; color: white;",
+      style        = "background: #DEF2F1;",
+      cell = function(value) {
+        if (is.na(value)) {
+          ""
+        } else if (is.numeric(value)) {
+          if (value %% 1 == 0) as.integer(value) else format(round(value, 2), nsmall = 2)
+        } else {
+          value
+        }
+      }
+    )
+  )
+}
+
+## edaSumCont
+##  · librerías: dplyr + reactable
+##  · objetivo : resumen estadístico de variable continua
+edaSumCont <- function(data, var){
+
+  data %>%
+    summarise(
+      mean  = round(mean(.data[[var]], na.rm = TRUE), 2),
+      sd    = round(sd(.data[[var]],   na.rm = TRUE), 2),
+      min   = min(.data[[var]],        na.rm = TRUE),
+      q25   = quantile(.data[[var]], 0.25, na.rm = TRUE),
+      med   = median(.data[[var]],     na.rm = TRUE),
+      q75   = quantile(.data[[var]], 0.75, na.rm = TRUE),
+      max   = max(.data[[var]],        na.rm = TRUE),
+      nNA   = sum(is.na(.data[[var]]))
+    ) %>% reactViewTable()
+}
+
+## edaHistCont
+##  · librería: ggplot2
+##  · objetivo : histograma de variable continua
+edaHistCont <- function(data, var, bins = 20){
+
+  ggplot(data, aes(x = .data[[var]])) +
+    geom_histogram(
+      bins  = bins,
+      color = "#2B7A78",
+      fill  = "#3AAFA9",
+      position = "dodge"
+    ) +
+    xlab(var) + ylab("Conteo") +
+    theme_classic() +
+    theme(
+      axis.text.x  = element_text(vjust = 0.6),
+      axis.text    = element_text(size = 12),
+      axis.title   = element_text(size = 14, face = "bold"),
+      legend.position = "bottom",
+      legend.title    = element_blank()
+    )
+}
+
+## edaBarCat
+##  · librería: ggplot2
+##  · objetivo : gráfico de barras de variable categórica
+edaBarCat <- function(data, var){
+
+  ggplot(data, aes(x = factor(.data[[var]]))) +
+    geom_bar(color = "#2B7A78", fill = "#3AAFA9") +
+    xlab(var) + ylab("Conteo") +
+    theme_classic() +
+    theme(
+      axis.text.x  = element_text(vjust = 0.6),
+      axis.text    = element_text(size = 12),
+      axis.title   = element_text(size = 14, face = "bold"),
+      legend.position = "bottom",
+      legend.title    = element_blank()
+    )
+}
+
+## edaDensityNum
+##  · librería: ggplot2
+##  · objetivo : densidad de variable numérica
+edaDensityNum <- function(data, var, xlimSup){
+
+  ggplot(data, aes(x = .data[[var]])) +
+    geom_density(color = "black", fill = "#3AAFA9") +
+    labs(title = paste("Densidad de", var), y = "Densidad") +
+    xlim(0, xlimSup) + xlab(var) +
+    theme_classic() +
+    theme(
+      axis.text.x  = element_text(vjust = 0.6),
+      axis.text    = element_text(size = 12),
+      axis.title   = element_text(size = 14, face = "bold"),
+      legend.position = "bottom",
+      legend.title    = element_blank()
+    )
+}
+
+## edaBarCatExp
+##  · librería: ggplot2
+##  · objetivo : barras por exposición de un factor
+edaBarCatExp <- function(data, var, exp,
+                         sizeXaxis = 10, angleXaxis = 0,
+                         vjustXaxis = 0.5, hjustXaxis = 0.5){
+
+  ggplot(data, aes(x = .data[[var]], y = .data[[exp]])) +
+    stat_summary(fun = "sum", geom = "bar",
+                 color = "#2B7A78", fill = "#3AAFA9") +
+    xlab(var) + ylab("Exposición") +
+    theme_classic() +
+    theme(
+      axis.text.x  = element_text(angle = angleXaxis,
+                                  vjust = vjustXaxis,
+                                  hjust = hjustXaxis,
+                                  size  = sizeXaxis),
+      axis.text    = element_text(size = 12),
+      axis.title   = element_text(size = 14, face = "bold"),
+      legend.position = "bottom",
+      legend.title    = element_blank()
+    )
+}
+```
+
+# 2. Datos
+
+En primer lugar, se recoge la explicación de las variables y posteriormente se muestra la base de datos en bruto. 
+
+## 2.1 Variables
+
+### Identificador
+
+* **poliza**: Número de póliza. 
+
+### Variables control/partición
+
+* **Samples**: variable binaria que identifica la muestra de modelización y la de validación.
+
+
+### Variables explicativas 
+
+* **condCarne**: antigüedad en años del carné del asegurado/conductor.
+* **condScore**: calificación crediticia del asegurado, puntuada del 1 (Muy buena) al 7 (Muy mala). El 99 corresponde a asegurados no evaluados que son nuevos o no se dispone de información suficiente.
+* **polAntiguedad**: antigüedad de la póliza en años.
+* **polTipoPago**: tipo de pago de la prima en función de la forma y frecuencia de pago.
+* **geoComunidad**: Comunidad Autónoma dónde reside el tomador.
+* **vehPotencia**: potencia del vehículo en caballos.
+* **vehValor**: valor del vehículo en el momento de la firma del contrato de seguro en euros.
+* **vehCombustible**: tipo de combustible del vehículo, puede ser “Gasolina”, “Diesel” u “Otros” (eléctrico, híbrido…).
+* **vehUso**: el uso al cual se destina el vehículo, puede ser: “Comercial”, si se emplea para una actividad profesional o bien “Particular”, si es para el transporte propio.
+* **vehClase**: clase de vehículo asegurado, por ejemplo, “Berlina”.
+* **vehPuertas**: número de puertas del vehículo.
+* **vehLong**: longitud del vehículo en milímetros.
+
+### Variables objetivo
+
+* **Exposicion**: periodo de tiempo en años que la póliza ha estado vigente y que, por tanto, el asegurado ha trasladado el riesgo a la entidad.
+* **NSinMatRC**: número de siniestros reclamados por el asegurado a la entidad durante el periodo de exposición, para Responsabilidad Civil de daños materiales.
+* **CSinMatRC**: cuantía total reclamada por parte del asegurado a la entidad durante el periodo de exposición, para Responsabilidad Civil de daños materiales.
+
+
+## 2.2 Base de datos 
+
+A continuación, se cargan los datos, los cuales nos ha facilitado el departamento de Data Engineering en formato csv.
+
+A continuación, se cargan los datos y se visualiza una muestra de ellos. 
+
+```{r DataImport, message=FALSE, warning=FALSE}
+
+
+data <- as.data.frame(read.csv('/Users/oscar/Desktop/BIG DATA/2o TRIMESTRE/MODULO 7_Big Data en el sector seguros/3_Evaluación Practica/CUESTION1_ModeloDeRiesgo/datosRiesgoCasoPracticoFinal.csv', encoding = "latin1")) 
+data %>% head(1000) %>% reactViewTableTarget(c( "Exposicion","NsinMatRC", "CsinMatRC"))
+  
+# Obtener dimensiones y formatear como tabla 2×2
+dim_tab <- tibble(
+  Medida = c("Filas", "Columnas"),
+  Valor  = dim(data)          # dim(data) devuelve (nFilas, nCols)
+)
+
+# Mostrar tabla compacta
+ knitr::kable(dim_tab)
+```
+
+# 3. Análisis exploratorio y nuevas variables
+
+En este punto se van a analizar tanto las variables objetivo como los rating factors, en busca de errores e inconsistencias. También se creará alguna variable nueva y se añadirán al estudio exploratorio. En modelos de riesgo actuariales se busca el entendimiento, con lo que no se crean variables muy complejas. Por tanto, las pocas lógicas a crear en función de las variables originales de la base de datos se crean casi desde un primer momento.
+
+
+
+
+## 3.1 Variables objetivo
+
+Buscamos ganar entendimiento de las variables objetivo, comprobamos que cumplen su lógica básica (sin valores negativos, distribución razonable) y que no hay incoherencias entre ellas.
+También calculamos frecuencia siniestral y coste medio para inspeccionarlos.
+
+### Coherencia entre variables objetivo
+
+Verificamos que no existan registros con 0 siniestros y coste positivo ni el caso inverso (siniestros sin coste).
+
+```{r coherenciaTargets, message=FALSE, warning=FALSE}
+data %>%
+  mutate(flagIncoherencia = case_when(
+    NsinMatRC == 0 & CsinMatRC > 0 ~ TRUE,
+    NsinMatRC >  0 & CsinMatRC == 0 ~ TRUE,
+    TRUE                           ~ FALSE
+  )) %>%
+  filter(flagIncoherencia) %>%
+  reactViewTable()
+```
+
+Se detectó **1 póliza incoherente**: presenta 2 siniestros reportados (`NsinMatRC = 2`) pero coste total `CsinMatRC = 0 €` con exposición 0.70 años.
+
+Siniestros sin coste: probable error de captura. La póliza se elimina del dataset, pues no es posible imputar un coste válido sin información adicional y su presencia sesga a la baja la severidad media.
+
+```{r}
+# 1) Identificar los registros incoherentes
+incoh_rows <- data %>%
+  filter(NsinMatRC > 0 & CsinMatRC == 0) %>%
+  pull(poliza)
+
+print(incoh_rows)  # muestra los identificadores encontrados
+
+# 2) Filtrar la base eliminando esas pólizas
+data <- data %>%
+  filter(!(poliza %in% incoh_rows))
+
+cat("Filas eliminadas por incoherencia:", length(incoh_rows), "\n")
+```
+### Exposicion 
+
+En primer lugar, se estudia la exposición y se chequea que no hay exposiciones 0 o negativas. 
+
+```{r edaTargExp, message=FALSE, warning=FALSE}
+
+data %>% edaSumCont("Exposicion")
+data %>% edaHistCont("Exposicion")
+
+```
+
+<br>
+
+La mayoría de pólizas tienen exposición ≤ 1 año, con un pico en 1 (año completo) y un volumen importante entre 0.3 y 0.6 años.
+	
+Existen Exposiciones 0 años. Es muy probable que los ceros visibles provengan del formato con el que mostramos los números, no de la base original ya que redondeamos cualquier numérico no entero a 2 decimales. 
+
+Hacemos una pequeña comprobación, ya que si no deberíamos limpiar estos datos para no tener futuras complicaciones en nuestro modelo.
+
+	
+```{r}
+sum(data$Exposicion == 0)                # verdaderos ceros exactos
+sum(data$Exposicion < 0.01 & data$Exposicion > 0)   # muy pequeños (< 0.01)
+```
+
+Como el primer resultado es 0 y el segundo es alto (125), sabemos que el problema era el redondeo visual.
+
+### Número Siniestros (NSinMatRC)
+
+```{r edaTargNsin, message=FALSE, warning=FALSE}
+
+# NsinMatRC
+data %>% edaSumCont("NsinMatRC")
+data %>% edaHistCont("NsinMatRC")
+
+```
+El histograma confirma una masa dominante en cero y una cola corta que decae rápidamente (1, 2, 3, 4 siniestros).
+
+* Sin limpieza necesaria: no hay valores negativos ni faltantes.
+  
+* Mantener tal cual para modelar la frecuencia con un GLM Poisson (link log).
+  
+* Recordar que la frecuencia real se calculará como NsinMatRC / Exposicion; la media ponderada será aún menor que 0.10 porque   la mayoría de pólizas tiene exposición < 1.
+	
+### Coste Siniestros (CSinMatRC)
+
+A continuación inspeccionamos la severidad agregada de daños materiales:
+	¿Hay cuantías negativas?
+	¿La distribución positiva recuerda a una Gamma (cola derecha amplia)?
+	¿Existen importes desproporcionados que puedan ser errores de captura?
+	
+```{r edaTargCsin, message=FALSE, warning=FALSE}
+# ➊ Resumen para todos los registros
+data %>% edaSumCont("CsinMatRC")
+
+# ➋ Resumen sólo para siniestros con coste positivo
+data %>%
+  filter(CsinMatRC > 0) %>%
+  edaSumCont("CsinMatRC")
+
+# ➌ Densidad (cola recortada al percentil 99 para visualizar mejor la zona central)
+lim_sup_csin <- quantile(data$CsinMatRC, 0.99, na.rm = TRUE)
+
+data %>%filter(CsinMatRC > 0) %>%edaDensityNum("CsinMatRC", xlimSup = lim_sup_csin)
+```
+<br>
+**Conclusiones sobre el coste total de siniestros (`CSinMatRC`)**
+
+| Métrica | Todos los registros | Sólo registros con coste > 0 |
+|---------|--------------------|------------------------------|
+| Media   | 87 €               | 934 €                       |
+| Desv. típ.| 622 €            | 1 831 €                     |
+| Mediana | 0 €                | 472 €                       |
+| Máximo  | 35 109 €           | 35 109 €                    |
+| NAs     | 0                  | 0                           |
+
+* **Distribución sesgada**: el 93 % de las pólizas tiene coste 0, lo cual es completamente normal; la cola positiva alcanza ~35 000 €, valor plausible para daños materiales graves.  
+* **Sin valores negativos ni faltantes**, por lo que no se requiere limpieza adicional.  
+* **Media condicionado a siniestro (≈ 934 €)** encaja con un siniestro medio moderado; la alta desviación confirma la dispersión típica.  
+
+Como control adicional, útil para documentación y tranquilidad, vamos a aislar rápidamente la cola y examinarla en contexto. Vamos a comprobar si tenemos valores por encima del percentil 99 y los revisaremos. Listar la cola > p99 ayuda a dejar constancia de que se ha revisado manualmente el extremo y que no se han detectado errores ni la necesidad de capar.
+
+```{r}
+p99 <- quantile(data$CsinMatRC, 0.99, na.rm = TRUE)
+data %>%
+  filter(CsinMatRC > p99) %>%
+  arrange(desc(CsinMatRC)) %>%
+  head(20) %>%
+  reactViewTable()
+```
+Hemos obtenido 20 registros por encima del percentil 99, lo que significan que son los siniestros más caros del año.
+El máximo (≈ 35 000 €) no es descabellado para daños materiales en autos (un siniestro grave con varios vehículos o un coche premium). Todos tienen NSinMatRC = 1 y exposición ≤ 1, por lo que no hay incoherencia interna. Como ya indicaba el máximo no vemos cuantías de seis cifras, así que no parecen errores de captura. 
+
+Mantenemos los datos tal cual, el rango es plausible y la muestra no es enorme. El modelo Gamma con link log absorberá la cola.
+
+### Frecuencia siniestral 
+
+Calculamos la frecuencia siniestral y examinamos su distribución. 
+
+\[\text{freqMatRC}= \frac{\text{NSinMatRC}}{\text{Exposicion}}\] 
+
+Además comparamos dos medias:
+
+* Media aritmética (la que devuelve la tabla auxiliar).
+* Media ponderada por exposición (la que realmente utilizará el GLM).
+
+```{r edaTargClaimFreq, message=FALSE, warning=FALSE}
+# ── 1 · Crear frecuencia y mostrar tabla + histograma (todos los registros)
+data %>%mutate(freqMatRC = NsinMatRC / Exposicion) %>%edaSumCont("freqMatRC")
+
+data %>%mutate(freqMatRC = NsinMatRC / Exposicion) %>%edaHistCont("freqMatRC")
+
+# ── 2 · Sólo pólizas con frecuencia > 0
+data %>%mutate(freqMatRC = NsinMatRC / Exposicion) %>%filter(freqMatRC > 0) %>%edaSumCont("freqMatRC")
+
+data %>%mutate(freqMatRC = NsinMatRC / Exposicion) %>%filter(freqMatRC > 0) %>%edaHistCont("freqMatRC")
+
+# ── 3 · Media ponderada por exposición (la que usa el modelo)
+mean_freq_weighted <- sum(data$NsinMatRC) / sum(data$Exposicion)
+mean_freq_weighted
+```
+
+La media aritmética de la frecuencia siniestral (0 .44) es superior a la media del número de siniestros (0 .10) porque la exposición media es 0 .59 años.
+La métrica que el modelo utilizará es la media ponderada por exposición (0 .17), que refleja 0.10 siniestros cada 0.59 años de riesgo.
+
+Media aritmética 0.44
+
+* Parece alta comparada con la expectativa sectorial (~0.1).
+
+* Se infla por unas pocas pólizas con frecuencia extrema.
+
+Máximo = 365. No es error matemático; es el efecto de dividir por exposiciones muy pequeñas.
+
+Sólo es posible para niveles extremos de exposición, inferiores o iguales a 0,01.En el EDA de Exposición hemos visto que nuestro dataset contiene 125 registros con Exposición entre 0 y 0,01. Por lo que puede tener coherencia. 
+
+
+Media ponderada 0.17
+
+* Es la que el modelo Poisson usará; todavía algo elevada, pero mucho más razonable que 0.44.
+
+* Confirma que las fracciones de exposición pequeñas reducen el peso de esas filas extremas.
+
+El GLM lo absorbe con la variable offset (log(Exposicion)). 
+
+Sin embargo, filas con exposición < 0.02 aportan inestabilidad numérica y muy poca información. Por ello, vamos a crear una versión “depurada” (data_trim) filtrando exposiciones muy pequeñas (Exposicion >= 0.02). Compararemos ambos modelos (full vs. trim) si la diferencia con el modelo completo es mínima adoptaremos la versión depurada. Si perdemos demasiado volumen o los coeficientes cambian drásticamente volveremos al dataset original.
+
+```{r}
+# Filtrar exposiciones < 0.02
+data_trim <- dplyr::filter(data, Exposicion >= 0.02)
+
+# Resumen rápido
+removed <- nrow(data) - nrow(data_trim)
+cat("Filas eliminadas por Exposicion < 0.02:", removed, "\n")
+
+# Nueva media ponderada de frecuencia
+mean_freq_trim <- sum(data_trim$NsinMatRC) / sum(data_trim$Exposicion)
+cat("Media ponderada (dataset trim):", round(mean_freq_trim, 3), "\n")
+```
+
+Durante la revisión de las variables objetivo se identificaron **308 registros (0.3 % de la muestra)** con exposiciones inferiores a 0.02 años (~7 días). Al dividir los siniestros por tiempos tan pequeños, estas filas generan frecuencias extremas (máximo 365).
+
+*La media ponderada de la frecuencia pasa de 0.170 a 0.168 al eliminarlas,lo que confirma su peso marginal.*
+
+*Mantendremos los registros* y modelizaremos con offset —el GLM Poisson pondera naturalmente la exposición. 
+
+### Coste medio
+
+Realizamos un análisis exploratorio del coste medio con el objetivo de comprender su distribución, detectar posibles valores atípicos.
+
+```{r edaTargClaimSev, message=FALSE, warning=FALSE}
+# ── 1 · Resumen y densidad de la severidad
+data %>%
+  filter(NsinMatRC > 0) %>%
+  mutate(sevMatRC = CsinMatRC / NsinMatRC) %>%
+  edaSumCont("sevMatRC")
+
+lim_sup_sev <- quantile(data$CsinMatRC / pmax(1, data$NsinMatRC), 0.99, na.rm = TRUE)
+
+data %>%
+  filter(NsinMatRC > 0) %>%
+  mutate(sevMatRC = CsinMatRC / NsinMatRC) %>%
+  edaDensityNum("sevMatRC", xlimSup = lim_sup_sev)
+
+# ── 2 · Media ponderada (modelo)
+mean_sev_weighted <- sum(data$CsinMatRC) / sum(data$NsinMatRC)
+cat("El coste medio ponderado observado es de",mean_sev_weighted, "euros por siniestro.\n")
+```
+La distribución del coste medio presenta una forma claramente asimétrica y sesgada a la derecha, coherente con una distribución gamma, lo cual es esperable en variables económicas como el coste de los siniestros. Este comportamiento indica que la mayoría de los casos tiene un coste bajo o moderado, mientras que existe una menor proporción de casos con costes elevados que influyen significativamente en la media. Esta característica justifica el uso de modelos que consideren dicha asimetría en etapas posteriores del análisis actuarial.
+Por otro lado, observamos una media ponderada un poco inferior a la de la tabla, esto se debe a que cada póliza aporta tantos “pesos” como siniestros haya tenido.
+Con pólizas multi-siniestro la ponderada suele ser inferior a la aritmética, porque divide entre un denominador mayor.
+
+
+## 3.2 Variables explicativas
+
+En esta sección revisaremos **una a una** las variables de rating, detectando distribuciones peculiares y proponiendo **categorizaciones simples**.  Al final de cada variable se fijará:
+
+* la **transformación** o agrupación sugerida,  
+* el **nivel base** (el de mayor exposición, evitando “Desconocido”).  
+
+Todas las transformaciones se aplicarán juntas en la etapa de pre-procesado, de modo que, si durante la modelización decidimos reagrupar, bastará con modificar una única función.
+
+###  condCarne — antigüedad (años) del carné
+
+```{r EDAcondCarne, message=FALSE, warning=FALSE}
+# Exposición por cada valor original
+niveles_condCarne <- sort(unique(data$condCarne))
+
+data %>%
+  mutate(condCarneFact = factor(condCarne, niveles_condCarne)) %>%
+  edaBarCatExp("condCarneFact", "Exposicion",
+               sizeXaxis = 7, angleXaxis = 90, vjustXaxis = 0.5, hjustXaxis = 1)
+
+# Exposición por niveles con agrupación (0–59, 60+)
+dataEda <- data %>%
+  mutate(condCarneFact = case_when(
+    condCarne >= 60 ~ "60+",
+    TRUE            ~ as.character(condCarne)
+  )) %>%
+  # Niveles: 0,1,…,59, luego 60+
+  mutate(condCarneFact = factor(
+    condCarneFact,
+    levels = c(as.character(0:59), "60+")
+  ))
+
+# Gráfico de barras por exposición
+dataEda %>%
+  edaBarCatExp("condCarneFact", "Exposicion",
+               sizeXaxis = 7, angleXaxis = 90, vjustXaxis = 0.5, hjustXaxis = 1)
+```
+
+Se ha optado por mantener los valores individuales de condCarne desde 0 hasta 59 para conservar el detalle de la variable, dado el volumen significativo de observaciones. No obstante, se agrupan los valores a partir de 60 años como “60+” debido a su escasa representatividad y posible comportamiento homogéneo. Valoraremos posibles agrupaciones futuras o aplicación de polinomios.
+
+Nivel base: 35
+
+###  condScore — calificación crediticia del asegurado
+
+```{r EDAcondScore, message=FALSE, warning=FALSE}
+### condScore — Puntuación del conductor
+
+# Ver exposición por niveles originales
+niveles_condScore <- sort(unique(data$condScore))
+
+data %>%
+  mutate(condScoreFact = factor(condScore, niveles_condScore)) %>%
+  edaBarCatExp("condScoreFact", "Exposicion",
+               sizeXaxis = 12, angleXaxis = 0, vjustXaxis = 0.5, hjustXaxis = 1)
+
+# Ver exposición por niveles ordenados según categorización propuesta
+dataEda <- dataEda %>%
+  mutate(condScoreFact = case_when(
+    condScore == 99 ~ "Nuevos", 
+    T ~ as.character(condScore)),
+        condScoreFact = factor(condScoreFact, (condScoreFact %>% unique)[condScoreFact %>% unique %>% str_remove_all("[[+-]]") %>% as.numeric  %>% order]))
+
+dataEda %>% 
+  edaBarCatExp("condScoreFact","Exposicion", 12, 0, 0.5, 0.5)
+
+```
+
+Recodificamos el 99 por nuevos, para así recordar el significado en el momento de modelizar y analizar las tendencias.
+
+Nivel Base: 1.
+
+
+###  polAntiguedad — antigüedad de la poliza en años
+
+```{r EDApolAntiguedad, message=FALSE, warning=FALSE}
+
+# Ver exposición por niveles de la variable original
+vec_polAntiguedad_levels <- data$polAntiguedad %>% unique() %>% sort()
+data %>% mutate(polAntiguedadFact = factor(polAntiguedad,vec_polAntiguedad_levels)) %>% edaBarCatExp("polAntiguedadFact","Exposicion", 12, 0, 0.5, 0.5)
+
+# Ver exposición por niveles ordenados de la categorización propuesta
+dataEda <- dataEda %>%
+  mutate(polAntiguedadFact = case_when(
+    polAntiguedad >= 5 ~ "5+", 
+    T ~ as.character(polAntiguedad)),
+        polAntiguedadFact = factor(polAntiguedadFact, (polAntiguedadFact %>% unique)[polAntiguedadFact %>% unique %>% str_remove_all("[[+-]]") %>% as.numeric  %>% order]))
+
+dataEda %>% 
+  edaBarCatExp("polAntiguedadFact","Exposicion", 12, 0, 0.5, 0.5)
+
+```
+```{r ExpopolAntiguedadFact, message=FALSE, warning=FALSE}
+dataEda %>%
+  group_by(polAntiguedadFact) %>%
+  summarise(Expo = round(sum(Exposicion), 2)) %>%
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>%
+  arrange(desc(PropExpo)) %>%
+  reactViewTable()
+```
+
+
+* Distribución muy concentrada en los cinco primeros años: aprox 95 % de la exposición corresponde a pólizas con ≤ 4 años de antigüedad.
+
+* Agrupar “5+” es coherente: los años 6-9-10… no consecutivos y además tienen poca masa (< 1 % cada uno); mantenerlos separados daría betas inestables.
+
+* Alternativa considerada: separar «0» (nuevas altas) del resto (1-4) y dejar «5+», pero el volumen de ’0’ ya es suficiente para estimar su propia beta.
+
+* Nivel Base: 2.
+
+###  polTipoPago — tipo de pago de la prima en función de la forma y frecuencia de pago.
+
+```{r Eda_polTipoPago, message=FALSE, warning=FALSE}
+# Exposición por la variable original (4 combinaciones)
+niveles_ori <- sort(unique(data$polTipoPago))
+
+data %>%
+  mutate(polTipoPagoFact = factor(polTipoPago, niveles_ori)) %>%
+  edaBarCatExp("polTipoPagoFact", "Exposicion",
+               sizeXaxis = 12, angleXaxis = 0, vjustXaxis = 0.5, hjustXaxis = 1)
+
+# Crear los dos factores separados y ordenados
+dataEda <- dataEda %>%
+  mutate(
+    polFreqPago = ifelse(grepl("^Semestral", polTipoPago), "Semestral", "Anual"),
+    polFreqPagoFact = factor(polFreqPago, c("Semestral", "Anual")),   # + fraccionamiento → – fraccionamiento
+    polModoPago = ifelse(grepl("Domiciliado$", polTipoPago), "Domiciliado", "Efectivo"),
+    polModoPagoFact = factor(polModoPago, c("Efectivo", "Domiciliado"))
+  )
+
+# Exposición por frecuencia de pago
+dataEda %>%
+  edaBarCatExp("polFreqPagoFact", "Exposicion",
+               sizeXaxis = 12, angleXaxis = 0, vjustXaxis = 0.5, hjustXaxis = 0.5)
+
+# Exposición por modo de pago
+dataEda %>%
+  edaBarCatExp("polModoPagoFact", "Exposicion",
+               sizeXaxis = 12, angleXaxis = 0, vjustXaxis = 0.5, hjustXaxis = 0.5)
+```
+```{r}
+## Exposición por frecuencia de pago (Semestral vs. Anual)
+tabla_freq <- dataEda %>%
+  group_by(polFreqPagoFact) %>%
+  summarise(Expo = round(sum(Exposicion), 2), .groups = "drop") %>%
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>%
+  arrange(desc(PropExpo))
+
+reactViewTable(tabla_freq)
+
+## Exposición por modo de pago (Efectivo vs. Domiciliado)
+tabla_modo <- dataEda %>%
+  group_by(polModoPagoFact) %>%
+  summarise(Expo = round(sum(Exposicion), 2), .groups = "drop") %>%
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>%
+  arrange(desc(PropExpo))
+
+reactViewTable(tabla_modo)
+```
+<br>
+
+Desdoblamos la variable polTipoPago creando dos factores independientes ganando claridad y permitiendo modelar, si fuera necesario,la interacción Frecuencia × Modo en etapas posteriores:
+
+`polFreqPagoFact` — frecuencia de pago
+
+* Reordenamos los niveles **de mayor fraccionamiento a menor** (`Semestral`, `Anual`) para facilitar la lectura de betas.  
+* La exposición se reparte **71.7 % Anual** vs. 28.3 % Semestral.  
+* **Nivel base seleccionado:** `Anual` (mayor exposición).
+
+`polModoPagoFact` — modo de pago
+
+* Separar `Efectivo` y `Domiciliado` permite capturar el posible efecto de domiciliación bancaria sobre la siniestralidad.  
+* La exposición es **64.7 % Domiciliado** y 35.3 % Efectivo.  
+* **Nivel base seleccionado:** `Domiciliado` (categoría dominante).
+
+###  geoComunidad — Comunidad autónoma donde reside el tomador
+
+```{r EDAgeoComunidad, message=FALSE, warning=FALSE}
+
+# Ver exposición por niveles de la variable original
+vec_geoComunidad_levels <- data$geoComunidad %>% unique() %>% sort()
+data %>% mutate(geoComunidadFact = factor(geoComunidad,vec_geoComunidad_levels)) %>% edaBarCatExp("geoComunidadFact","Exposicion", 10, 90, 0.5, 1)
+
+# Tabla para ver el porcentaje de exposición
+data %>% group_by(geoComunidad) %>% 
+  summarise(Exposicion = round(sum(Exposicion),2),
+            PropExpo = round(sum(Exposicion)/sum(data$Exposicion),2))%>% 
+  arrange(desc(Exposicion)) %>% 
+  reactViewTable
+
+# Ver exposición por niveles ordenados de la categorización propuesta
+dataEda <- dataEda %>%
+  mutate(geoComunidadFact = case_when(
+    geoComunidad %in% c("Comunidad de Madrid","Cataluña","Andalucía","Castilla-La Mancha","Comunidad Valenciana") ~ as.character(geoComunidad), 
+    T ~ "RESTO"),
+        geoComunidadFact = factor(geoComunidadFact, c("Comunidad de Madrid","Cataluña","Andalucía","Castilla-La Mancha","Comunidad Valenciana","RESTO")))
+
+dataEda %>% 
+  edaBarCatExp("geoComunidadFact","Exposicion", 12, 45, 1, 1)
+
+```
+
+La variable geoComunidad incluye 17 Comunidades Autónomas, pero la exposición se concentra en cinco territorios que superan el 1 % individual (Comunidad de Madrid, Cataluña, Andalucía, Castilla-La Mancha y Comunidad Valenciana).
+
+Para garantizar estabilidad en la estimación de coeficientes —y evitar betas con alta varianza— se mantiene cada una de esas cinco comunidades como nivel propio y se agrupan las restantes en “RESTO”.
+
+**Nivel base seleccionado:** Comunidad de Madrid, por ser la categoría con mayor exposición de la cartera.
+
+### vehPotencia - Potencia del vehículo en caballos
+
+```{r EDAvehPotencia, message=FALSE, warning=FALSE}
+
+# Ver exposición por niveles de la variable original
+data  %>% edaDensityNum("vehPotencia",300)
+
+# Ver exposición por niveles de la categorización propuesta
+dataEda <- dataEda %>%
+  mutate(
+  vehPotenciaFact = case_when(
+    vehPotencia <   50 ~ "0-50",
+    vehPotencia <   75 ~ "50-75",
+    vehPotencia <  100 ~ "75-100",
+    vehPotencia <  125 ~ "100-125",
+    vehPotencia <  150 ~ "125-150",
+    vehPotencia <  175 ~ "150-175",
+    vehPotencia <  200 ~ "175-200",
+    TRUE               ~ "200+"
+  ),
+  vehPotenciaFact = factor(vehPotenciaFact,
+    c("0-50","50-75","75-100","100-125","125-150","150-175","175-200","200+"))
+)
+
+dataEda %>% 
+  edaBarCatExp("vehPotenciaFact","Exposicion", 12, 0, 0.5, 0.5)
+
+```
+
+
+La densidad muestra dos picos principales alrededor de 90 CV y 110 CV, con una cola decreciente a partir de 150 CV.Detectamos poca masa al principio del gráfico y decidimos hacer una categoría mas amplia (0-50) que recoja, tal vez, cierto tipo de vehículos especiales o diferentes al resto, con un comportamiento particular.
+
+* Los grupos 75-100 y 100-125 concentran la mayor parte de la exposición (≈ 5 000 y 5 200 póliza-año respectivamente).
+
+* Los extremos 0-50 y 200+ tienen exposición residual, pero siguen aportando masa suficiente para estimar betas (no necesitan fusionarse).
+
+* El escalonado de 25 CV resulta granular sin generar niveles vacíos.
+
+**Nivel base propuesto:**  100-125 CV (mayor exposición individual).
+
+### vehValor - Valor del vehículo a la firma del contrato.
+
+```{r EDAvehValor, message=FALSE, warning=FALSE}
+
+# Ver exposición por niveles de la variable original
+
+data %>% edaDensityNum("vehValor", 100000)
+
+# Imputar valores negativos con la media global de los valores positivos
+media_global <- mean(data$vehValor[data$vehValor > 0], na.rm = TRUE)
+
+dataEda <- dataEda %>%
+  mutate(
+    vehValor_imp = ifelse(vehValor < 0, media_global, vehValor),
+
+# Ver exposición por niveles de la categorización propuesta
+    vehValorFact = case_when(
+      vehValor_imp < 0            ~ "0-10000",      # no quedarán negativos, pero por coherencia
+      vehValor_imp < 10000        ~ "0-10000",
+      vehValor_imp < 12500        ~ "10000-12500",
+      vehValor_imp < 15000        ~ "12500-15000",
+      vehValor_imp < 17500        ~ "15000-17500",
+      vehValor_imp < 20000        ~ "17500-20000",
+      vehValor_imp < 22500        ~ "20000-22500",
+      vehValor_imp < 25000        ~ "22500-25000",
+      vehValor_imp < 30000        ~ "25000-30000",
+      vehValor_imp < 35000        ~ "30000-35000",
+      vehValor_imp < 40000        ~ "35000-40000",
+      vehValor_imp < 45000        ~ "40000-45000",
+      vehValor_imp < 50000        ~ "45000-50000",
+      TRUE                        ~ "50000+"
+    ),
+    vehValorFact = factor(vehValorFact,
+      c("0-10000", "10000-12500", "12500-15000", "15000-17500",
+        "17500-20000", "20000-22500", "22500-25000", "25000-30000",
+        "30000-35000", "35000-40000", "40000-45000", "45000-50000", "50000+"))
+  )
+
+# Exposición por tramo (gráfico)
+dataEda %>%
+  edaBarCatExp("vehValorFact", "Exposicion", 12, 45, 1, 1)
+```
+
+
+* Se detectaron 3 valores negativos de vehValor (errores de captura). Se imputan a la media global de los valores positivos.
+
+* Tramos de 2 500 €–5 000 € mantienen poblados los niveles medios (20 000 € – 30 000 €).
+
+* **Nivel base:** 20000-22500 (máxima exposición individual).
+
+* La imputación afecta < 0.05 % de la muestra, por lo que su impacto en la estimación de betas será despreciable y queda debidamente documentada.
+
+### vehCombustible - Gasolina, Diesel u Otros(eléctrico,híbrido...)
+
+```{r EDAvehCombustible, message=FALSE, warning=FALSE}
+
+# Ver exposición por niveles de la variable original
+vec_vehCombustible_levels <- data$vehCombustible %>% unique() %>% sort()
+
+dataEda <- dataEda %>% mutate(vehCombustibleFact = factor(vehCombustible,vec_vehCombustible_levels))
+
+dataEda %>% edaBarCatExp("vehCombustibleFact","Exposicion", 12, 0, 0.5, 0.5)
+
+dataEda %>% 
+  group_by(vehCombustibleFact) %>% 
+  summarise(Expo = round(sum(Exposicion), 2), .groups = "drop") %>% 
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>% 
+  arrange(desc(PropExpo)) %>% 
+  reactViewTable()
+```
+<br>
+
+Distribución muy desequilibrada: Diésel ≈ 61 %, Gasolina ≈ 37 %, Otros < 2 %.
+
+Nada que agrupar; la categoría Otros se conserva para capturar efectos de híbridos/eléctricos.
+
+* **Nivel base:** Diésel.
+
+
+
+### vehUso - Uso del vehículo (Comercial o Particular)
+
+```{r EDAvehUso, message=FALSE, warning=FALSE}
+
+# Ver exposición por niveles de la variable original
+vec_vehUso_levels <- data$vehUso %>% unique() %>% sort()
+
+dataEda <- dataEda %>% mutate(vehUsoFact = factor(vehUso,vec_vehUso_levels)) 
+
+dataEda %>% edaBarCatExp("vehUsoFact","Exposicion", 12, 0, 0.5, 0.5)
+
+dataEda %>% 
+  group_by(vehUsoFact) %>% 
+  summarise(Expo = round(sum(Exposicion), 2), .groups = "drop") %>% 
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>% 
+  arrange(desc(PropExpo)) %>% 
+  reactViewTable()
+```
+<br>
+
+Particular concentra ~ 90 % de la exposición; Comercial el resto.
+
+Se mantiene la variable tal cual.
+
+* **Nivel base:** Particular.
+
+### vehClase - Clase de vehículo asegurado.
+
+```{r EDAvehClase, message=FALSE, warning=FALSE}
+# Niveles originales ordenados alfabéticamente
+niveles_vehClase <- sort(unique(data$vehClase))
+
+# Exposición por nivel (gráfico de barras)
+data %>%
+  mutate(vehClaseFact = factor(vehClase, niveles_vehClase)) %>%
+  edaBarCatExp("vehClaseFact", "Exposicion",
+               sizeXaxis = 10, angleXaxis = 45, vjustXaxis = 1, hjustXaxis = 1)
+
+# Tabla con porcentaje de exposición
+tabla_vehClase <- data %>%
+  group_by(vehClase) %>%
+  summarise(Expo = round(sum(Exposicion), 2), .groups = "drop") %>%
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>%
+  arrange(desc(PropExpo))
+
+reactViewTable(tabla_vehClase)
+
+dataEda <- dataEda %>% 
+  mutate(
+    vehClaseFact = case_when(
+      vehClase == "COUPE" ~ "OTRO",          # < 1 % → se agrupa
+      TRUE                ~ vehClase
+    ),
+    vehClaseFact = factor(vehClaseFact, c("BERLINA", "FAMILIAR", "OTRO"))
+  )
+
+# Gráfico de barras tras la fusión “COUPE” → “OTRO”
+dataEda %>%
+  edaBarCatExp("vehClaseFact", "Exposicion",
+               sizeXaxis = 12, angleXaxis = 0,
+               vjustXaxis = 0.5, hjustXaxis = 0.5)
+
+# Tabla de control tras la fusión
+dataEda %>% 
+  group_by(vehClaseFact) %>% 
+  summarise(Expo = round(sum(Exposicion), 2), .groups = "drop") %>% 
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>% 
+  reactViewTable()
+```
+<br>
+
+Distribución: dos categorías dominantes (Berlina ≈ 51 %, Otros ≈ 45 %) y un segmento minoritario (Familiar 4,6 %).
+
+* Agrupación aplicada: “COUPE” se fusiona en “OTRO” para evitar coeficientes con alta varianza (< 1 % de exposición).
+
+* **Nivel base:** Berlina, al ser la clase con mayor exposición.
+
+La variable resultante (vehClaseFact) queda lista para la fase de modelización sin necesidad de ajustes adicionales.
+
+### vehPuertas - Num. de puertas del vehículo.
+
+```{r EDAvehPuertas, message=FALSE, warning=FALSE}
+# Distribución original 
+niveles_puertas <- sort(unique(data$vehPuertas))
+
+data %>%
+  mutate(vehPuertasFact = factor(vehPuertas, niveles_puertas)) %>%
+  edaBarCatExp("vehPuertasFact", "Exposicion",
+               sizeXaxis = 10, angleXaxis = 0,
+               vjustXaxis = 0.5, hjustXaxis = 0.5)
+
+# Tabla con porcentaje de exposición
+tabla_puertas <- data %>%
+  group_by(vehPuertas) %>%
+  summarise(Expo = round(sum(Exposicion), 2), .groups = "drop") %>%
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>%
+  arrange(desc(PropExpo))
+
+reactViewTable(tabla_puertas)
+
+# Versión agrupada 
+dataEda <- dataEda %>% 
+  mutate(
+    vehPuertasFact = case_when(
+      vehPuertas >= 5       ~ "5+",
+      vehPuertas == 4       ~ "4",
+      vehPuertas <= 3       ~ "0-3"
+    ),
+    vehPuertasFact = factor(vehPuertasFact, c("5+", "4", "0-3"))
+  )
+
+# Gráfico de barras con la versión agrupada
+dataEda %>%
+  edaBarCatExp("vehPuertasFact", "Exposicion",
+               sizeXaxis = 10, angleXaxis = 0,
+               vjustXaxis = 0.5, hjustXaxis = 0.5)
+```
+<br>
+
+* La gran mayoría de vehículos asegurados son turismos de 5 puertas (≈ 85 %).
+
+* El segmento de 4 puertas (≈ 9 %) conserva masa suficiente para estimar betas específicas.
+
+* El tramo “0-3” (≈ 6 % exposición) agrupa vehículos de 0, 2 y 3 puertas, evitando niveles residuales con varianza elevada.
+
+* **Nivel base:** 5 + puertas, por ser el nivel dominante de la cartera.
+
+### vehLong - Longitud del vehículo en mm.
+
+```{r EDAvehLong, message=FALSE, warning=FALSE}
+# Densidad de la longitud (recorta a 6 000 mm para ver cola principal)
+data %>% edaDensityNum("vehLong", xlimSup = 6000)
+
+# tabla de deciles
+deciles <- quantile(data$vehLong, probs = seq(0, 1, 0.1), na.rm = TRUE)
+
+tabla_deciles <- tibble(
+  Decil = paste0("D", 1:10),
+  Lower = round(deciles[-11], 0),
+  Upper = round(deciles[-1], 0)
+) %>%
+  rowwise() %>%
+  mutate(
+    Expo = sum(data$Exposicion[data$vehLong >= Lower & data$vehLong < Upper])
+  ) %>%
+  ungroup() %>%
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2))
+
+reactViewTable(tabla_deciles)
+
+# Crear factor agrupado
+dataEda <- dataEda %>%
+  mutate(
+    vehLongFact = cut(
+      vehLong,
+      breaks = c(-Inf, 4000, 4300, 4600, Inf),
+      labels = c("<4000", "4000-4300", "4300-4600", "4600+"),
+      right  = FALSE                       # intervalo [a,b)
+    ),
+    vehLongFact = factor(vehLongFact, c("<4000","4000-4300","4300-4600","4600+"))
+  )
+
+# Tabla de exposición por tramo
+dataEda %>% 
+  group_by(vehLongFact) %>% 
+  summarise(Expo = round(sum(Exposicion), 2), .groups="drop") %>% 
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>% 
+  reactViewTable()
+
+# Gráfico de barras
+dataEda %>% 
+  edaBarCatExp("vehLongFact", "Exposicion",
+               sizeXaxis = 12, angleXaxis = 0,
+               vjustXaxis = 0.5, hjustXaxis = 0.5)
+```
+<br>
+
+
+* La longitud se agrupa en cuatro tramos: < 4000, 4000-4300,4300-4600 y > 4600 mm.
+
+* Los dos segmentos centrales concentran > 80 % de la exposición; los tramos corto y largo se mantienen para capturar posibles diferencias de riesgo.
+
+* **Nivel base seleccionado:** 4000-4300 mm (mayor exposición individual).
+
+## 3.3 Nuevas variables
+
+Creamos la variable **vehValorPot** que nos relaciona Valor / Potencia € por caballo-vapor. Vehículos “premium” (alto €/CV) tienden a tener piezas más caras ⇒ ↑ severidad. Mantén la variable de momento: el coste de probarla es nulo y te da una dimensión distinta del valor del coche.  Se evaluará su aportación estadística; se descartará si resulta redundante o colineal con vehValor.
+
+```{r EDAValorPotencia, message=FALSE, warning=FALSE}
+
+# Calcular la ratio Valor/Potencia
+dataEda <- dataEda %>%
+  mutate(
+    vehValorPot = ifelse(vehPotencia > 0,
+                              vehValor / vehPotencia,
+                              NA_real_),
+
+# Categorización fija con case_when
+    vehValorPotFact = case_when(
+      vehValorPot < 170          ~ "<170",
+      vehValorPot < 200          ~ "170-200",
+      vehValorPot < 230          ~ "200-230",
+      TRUE                            ~ "230+"
+    ),
+    vehValorPotFact = factor(vehValorPotFact,
+      c("<170", "170-200", "200-230", "230+"))
+  )
+
+# Densidad recortada al p99 (visual)
+lim_sup_vp <- quantile(dataEda$vehValorPot, 0.99, na.rm = TRUE)
+dataEda %>% edaDensityNum("vehValorPot", xlimSup = lim_sup_vp)
+
+# Exposición por tramo
+dataEda %>%
+  edaBarCatExp("vehValorPotFact", "Exposicion",
+               sizeXaxis = 10, angleXaxis = 0,
+               vjustXaxis = 0.5, hjustXaxis = 0.5)
+
+# Tabla de exposición (%) 
+dataEda %>%
+  group_by(vehValorPotFact) %>%
+  summarise(Expo = round(sum(Exposicion), 2), .groups = "drop") %>%
+  mutate(PropExpo = round(Expo / sum(Expo) * 100, 2)) %>%
+  reactViewTable()
+```
+
+<br>
+
+* La ratio Valor/Potencia se discretiza en 4 tramos con masa equilibrada; el grupo 170-200 €/CV concentra la mayor exposición y se fija como **nivel base.**
+
+* Esta variable captura lo premium que es un vehículo — esperamos que los tramos altos se asocien a mayor severidad por coste de recambios.
+<br>
+
+## 3.4 Resumen y preprocesado
+
+En la tabla siguiente se recogen todas las decisiones adoptadas tras el EDA; cada punto indica la transformación aplicada y el nivel base que se fijará en el modelo. Estas transformaciones quedan implementadas en la función preprocess(), garantizando que cualquier conjunto de datos futuro reciba exactamente el mismo tratamiento antes de la modelización.
+
+* **condCarne**: Agrupación: valores individuales 0-59; “60+” para ≥ 60 años. Nivel base: 35.
+
+* **condScore**: Recodificamos el 99 por “Nuevos”. Nivel base: 1.
+
+* **polAntiguedad**: Agrupamos todas las categorías a partir de 5 años ⇒ “5+”. Nivel base: 2.
+
+* **polFreqPago**: Factor independiente (Semestral / Anual) reordenado de mayor a menor fraccionamiento.Nivel base: Anual.
+
+* **polModoPago**: Factor independiente (Efectivo / Domiciliado). Nivel base: Domiciliado.
+
+* **geoComunidad**: Se mantienen las que superan el 1 % de exposición (Madrid, Cataluña, Andalucía, Castilla-La Mancha, Comunidad Valenciana); El resto se agrupan como “RESTO”. Nivel base: Comunidad de Madrid.
+
+* **vehPotencia**: Agrupamos en 8 tramos: 0-50, 50-75, 75-100, 100-125, 125-150, 150-175, 175-200, 200+. Nivel base: 100-125 CV.
+
+* **vehValor**: Encontramos 3 valores negativos imputados a la media global. Agrupamos en 13 tramos (0-10 k … 50 k+).Nivel base: 20 000-22 500 €.
+
+* **vehCombustible**: Sin cambios. Nivel base: Diésel.
+
+* **vehUso**: Sin cambios. Nivel base: Particular.
+
+* **vehClase**: La categoría Coupé (0,8 %) fusionado en “OTRO”: Berlina, Familiar, OTRO. Nivel base: Berlina.
+
+* **vehPuertas**: Se agrupa en 5+, 4, 0-3 (0 puertas agrupado). Nivel base: 5+.
+
+* **vehLong** Agrupamos en 4 tramos < 4000, 4000-4300, 4300-4600, > 4600 mm. Nivel base: 4000-4300 mm.
+
+* **vehValorPotencia (nueva)**: Agrupamos enrRatio Valor/Potencia; tramos: < 170, 170-200, 200-230, ≥ 230 €/CV. Nivel base: 170-200 €/CV.
+
+A continuación se define preprocess(), la función que aplica de forma automática y coherente todas las transformaciones acordadas en el EDA.
+
+La función devuelve una muestra del data frame listo para modelizar.
+
+```{r PreProcess, message=FALSE, warning=FALSE}
+preprocess <- function(data) {
+  # 1) Partida: nunca tocamos 'data' directamente
+  dataClean <- data
+  
+  # 2) Por variable, en orden:
+  dataClean <- dataClean %>%
+    
+    ## condCarne
+     mutate(
+      condCarneFact = case_when(
+        condCarne >= 60 ~ "60+",
+        TRUE            ~ as.character(condCarne)
+      ),
+      condCarneFact = factor(
+        condCarneFact,
+        levels = c(as.character(0:59), "60+")
+      ) %>% fct_relevel("35")
+    ) %>%
+    
+    ## condScore
+    mutate(
+      condScoreFact = case_when(condScore == 99 ~ "Nuevos",
+                                TRUE            ~ as.character(condScore)),
+      condScoreFact = factor(condScoreFact,
+                             levels = c("1","2","3","4","5","6","7","Nuevos")) %>%
+                      fct_relevel("1")
+    ) %>%
+    
+    ## polAntiguedad
+    mutate(
+      polAntiguedadFact = case_when(polAntiguedad >= 5 ~ "5+",
+                                    TRUE               ~ as.character(polAntiguedad)),
+      polAntiguedadFact = factor(polAntiguedadFact,
+                                 levels = c("0","1","2","3","4","5+")) %>%
+                          fct_relevel("2")
+    ) %>%
+    
+    ## polFreqPago & polModoPago (de polTipoPago)
+    mutate(
+      polFreqPago     = ifelse(grepl("^Semestral", polTipoPago), "Semestral", "Anual"),
+      polFreqPagoFact = factor(polFreqPago, levels = c("Semestral","Anual")) %>%
+                        fct_relevel("Anual"),
+      polModoPago     = ifelse(grepl("Domiciliado$", polTipoPago), "Domiciliado", "Efectivo"),
+      polModoPagoFact = factor(polModoPago, levels = c("Efectivo","Domiciliado")) %>%
+                        fct_relevel("Domiciliado")
+    ) %>%
+    
+    ## geoComunidad
+    mutate(
+      geoComunidadFact = case_when(
+        geoComunidad %in% c("Comunidad de Madrid","Cataluña","Andalucía",
+                            "Castilla-La Mancha","Comunidad Valenciana") ~ geoComunidad,
+        TRUE ~ "RESTO"
+      ),
+      geoComunidadFact = factor(geoComunidadFact,
+                                levels = c("Comunidad de Madrid","Cataluña","Andalucía",
+                                           "Castilla-La Mancha","Comunidad Valenciana","RESTO")) %>%
+                         fct_relevel("Comunidad de Madrid")
+    ) %>%
+    
+    ## vehPotencia
+    mutate(
+      vehPotenciaFact = case_when(
+        vehPotencia <  50 ~ "0-50",
+        vehPotencia <  75 ~ "50-75",
+        vehPotencia < 100 ~ "75-100",
+        vehPotencia < 125 ~ "100-125",
+        vehPotencia < 150 ~ "125-150",
+        vehPotencia < 175 ~ "150-175",
+        vehPotencia < 200 ~ "175-200",
+        TRUE              ~ "200+"
+      ),
+      vehPotenciaFact = factor(vehPotenciaFact,
+                               levels = c("0-50","50-75","75-100","100-125",
+                                          "125-150","150-175","175-200","200+")) %>%
+                        fct_relevel("100-125")
+    ) %>%
+    
+    ## vehValor (imputación y tramos)
+    mutate(
+      vehValor_imp = ifelse(vehValor < 0,
+                            mean(vehValor[vehValor > 0], na.rm = TRUE),
+                            vehValor),
+      vehValorFact = case_when(
+        vehValor_imp < 10000 ~ "0-10000",
+        vehValor_imp < 12500 ~ "10000-12500",
+        vehValor_imp < 15000 ~ "12500-15000",
+        vehValor_imp < 17500 ~ "15000-17500",
+        vehValor_imp < 20000 ~ "17500-20000",
+        vehValor_imp < 22500 ~ "20000-22500",
+        vehValor_imp < 25000 ~ "22500-25000",
+        vehValor_imp < 30000 ~ "25000-30000",
+        vehValor_imp < 35000 ~ "30000-35000",
+        vehValor_imp < 40000 ~ "35000-40000",
+        vehValor_imp < 45000 ~ "40000-45000",
+        vehValor_imp < 50000 ~ "45000-50000",
+        TRUE                  ~ "50000+"
+      ),
+      vehValorFact = factor(vehValorFact,
+                            levels = c("0-10000","10000-12500","12500-15000",
+                                       "15000-17500","17500-20000","20000-22500",
+                                       "22500-25000","25000-30000","30000-35000",
+                                       "35000-40000","40000-45000","45000-50000",
+                                       "50000+")) %>%
+                     fct_relevel("20000-22500")
+    ) %>%
+    
+    ## vehCombustible
+    mutate(
+      vehCombustibleFact = factor(vehCombustible,
+                                  levels = c("Diesel","Gasolina","Otros")) %>%
+                           fct_relevel("Diesel")
+    ) %>%
+    
+    ## vehUso
+    mutate(
+      vehUsoFact = factor(vehUso,
+                          levels = c("Particular","Comercial")) %>%
+                   fct_relevel("Particular")
+    ) %>%
+    
+    ## vehClase
+    mutate(
+      vehClaseFact = case_when(vehClase == "COUPE" ~ "OTRO",
+                               TRUE                ~ vehClase),
+      vehClaseFact = factor(vehClaseFact,
+                            levels = c("BERLINA","FAMILIAR","OTRO")) %>%
+                     fct_relevel("BERLINA")
+    ) %>%
+    
+    ## vehPuertas
+    mutate(
+      vehPuertasFact = case_when(vehPuertas >= 5 ~ "5+",
+                                 vehPuertas == 4 ~ "4",
+                                 TRUE            ~ "0-3"),
+      vehPuertasFact = factor(vehPuertasFact,
+                              levels = c("0-3","4","5+")) %>%
+                       fct_relevel("5+")
+    ) %>%
+    
+    ## vehLong
+    mutate(
+      vehLongFact = case_when(vehLong < 4000 ~ "<4000",
+                              vehLong < 4300 ~ "4000-4300",
+                              vehLong < 4600 ~ "4300-4600",
+                              TRUE           ~ "4600+"),
+      vehLongFact = factor(vehLongFact,
+                           levels = c("<4000","4000-4300","4300-4600","4600+")) %>%
+                    fct_relevel("4000-4300")
+    ) %>%
+    
+    ## vehValorPot (nueva)
+    mutate(
+      vehValorPot    = ifelse(vehPotencia > 0, vehValor_imp/vehPotencia, NA_real_),
+      vehValorPotFact = case_when(
+        vehValorPot < 170 ~ "<170",
+        vehValorPot < 200 ~ "170-200",
+        vehValorPot < 230 ~ "200-230",
+        TRUE              ~ "230+"
+      ),
+      vehValorPotFact = factor(vehValorPotFact,
+                               levels = c("<170","170-200","200-230","230+")) %>%
+                        fct_relevel("170-200")
+    )
+  
+  # 3) Quito originales + quito sufijo “Fact”
+  fact_cols <- names(dataClean)[str_ends(names(dataClean), "Fact")]
+  orig_cols <- str_remove(fact_cols, "Fact$")
+  
+  dataClean <- dataClean %>%
+    select(-all_of(orig_cols)) %>%
+    rename_with(~ str_remove(., "Fact$"), fact_cols)
+  
+  return(dataClean)
+}
+
+# Aplicación
+dataModel <- preprocess(data %>% filter(samples == "Modelling") %>% select(-samples))
+reactViewTableTarget(dataModel %>% head(1000), c("Exposicion","NsinMatRC","CsinMatRC"))
+```
+
+
+# 4. Funciones para el análisis de modelos
+
+En este apartado se presentan varias funciones diseñadas para facilitar el análisis de los modelos estimados. La primera permite extraer de forma automatizada las métricas principales de cada modelo ajustado, aplicadas a todos los factores incluidos en el análisis. Además, se han desarrollado dos funciones adicionales que permiten visualizar gráficamente los resultados, con el objetivo de interpretar fácilmente el efecto marginal de cada variable y comparar el comportamiento de los distintos factores incluidos en el modelo.
+
+
+```{r FuncionAnalysisModelos, message=FALSE, warning=FALSE}
+# Auxiliar para ejecutar paso a paso la función
+# model <- glmFreqFull_Mat
+# modelNoPol <- glmFreqFull_Mat
+# data <- dataModel
+# target <- "NsinMatRC"
+# weight <- "Exposicion"
+# vecVars <- fullFactors
+# listOrderFactLevels <- listOrderFactLevels
+# funModPol <- NULL
+# CompareModels <- FALSE
+
+ModelAnalysisFinal <- function(model, modelNoPol, data, target, weight, vecVars,
+                               listOrderFactLevels = NULL, funModPol = NULL, CompareModels = FALSE) {
+
+  # 1) Nivel base de cada factor
+  vecBaseLevels <- data %>% select(all_of(vecVars)) %>% sapply(function(x) levels(x)[1], USE.NAMES = TRUE)
+
+  # 2) Lista de niveles: o bien de tu EDA, o bien alfabética
+  orderLevelsRatingFactorsForPlots <- function(x) {
+    lvl <- levels(x)
+   
+     if (all(!is.na(suppressWarnings(as.numeric(lvl))))) {
+      lvl[order(as.numeric(lvl))]
+    } else {
+      lvl
+    }
+  }
+  listVarLevels <- if (is.null(listOrderFactLevels)) {
+    data %>% select(all_of(vecVars)) %>% lapply(orderLevelsRatingFactorsForPlots)
+  } else {
+    listOrderFactLevels[vecVars]
+  }
+
+  # 3) Creamos el grid de combinaciones para los efectos marginales
+  dfVarsLevelsAndBase <- function(i) {
+    var  <- vecVars[i]
+    lvl  <- listVarLevels[[i]]
+    df   <- data.frame(Factor = var, Level = lvl, stringsAsFactors = FALSE)
+    for (v in vecVars) {
+      df[[v]] <- if (v == var) lvl else vecBaseLevels[v]
+    }
+    df[[weight]] <- 1
+    df
+  }
+  CMData <- bind_rows(lapply(seq_along(vecVars), dfVarsLevelsAndBase))
+  if (!is.null(funModPol)) CMData <- funModPol(CMData)
+
+  # 4) Efectos marginales con reescalado **por factor**
+CalcMarginalEffects <- function(m, CMData) {
+  # calculamos predictor lineal y respuesta para todo
+  df <- CMData %>%
+    mutate(
+      LinearPredictor = predict(m, newdata = CMData, type = "link"),
+      PredictedValues = predict(m, newdata = CMData, type = "response")
+    )
+  
+  # ahora, para cada factor, restamos el LP del nivel base que tú definiste
+  df2 <- df %>% group_by(Factor) %>%
+    mutate(
+      # buscamos el LP donde Level == vecBaseLevels[Factor]
+      LP_base = LinearPredictor[Level == vecBaseLevels[Factor][1]],
+      RescaledLinearPredictor  = LinearPredictor - LP_base,
+      RescaledPredictedValues  = exp(RescaledLinearPredictor)
+    ) %>%
+    ungroup() %>%
+    select(Factor, Level, LinearPredictor, PredictedValues,
+           RescaledLinearPredictor, RescaledPredictedValues)
+  
+  return(df2)
+}
+  
+  ME     <- CalcMarginalEffects(model,    CMData)
+  ME_noP <- CalcMarginalEffects(modelNoPol, CMData) %>%
+    setNames(c("Factor","Level", paste0("NoPol_", names(.)[-1:-2])))
+  if (!CompareModels) ME_noP[,-1:-2] <- NA
+  
+  MarginalEffectsTotal <- left_join(ME, ME_noP, by = c("Factor","Level"))
+  
+  # 5) Observado vs Predecido
+  calcExpObsPredByLevels <- function(f) {
+    data %>%
+      mutate(PredNoExp = predict(model, data, type = "response")) %>%
+      group_by_at(f) %>%
+      summarise(
+        Factor = f,
+        Exp    = sum(get(weight)),
+        Obs    = sum(get(target))/sum(get(weight)),
+        Pred   = sum(PredNoExp)/sum(get(weight)),
+        .groups = "drop"
+      ) %>%
+      rename(Level = !!sym(f))
+  }
+  DataExpObsPred <- bind_rows(lapply(vecVars, calcExpObsPredByLevels))
+
+  # 6) Unimos todo
+  FullDataMetrics <- left_join(MarginalEffectsTotal, DataExpObsPred,
+                               by = c("Factor","Level"))
+  FullDataMetrics
+}
+
+modelAnalysisPlotsFinal <- function(dataMetrics, metric1, metric2, factor,
+                                    colorLine1, colorLine2,
+                                    sizeXaxis, angleXaxis, vjustXaxis, hjustXaxis) {
+  
+  # 1) Filtrar solo las filas de este factor
+  df <- dataMetrics %>% filter(Factor == factor)
+  
+  # 2) Calcular límites y coeficientes de reescalado
+  ylim.prim <- c(0, max(df$Exp, na.rm = TRUE))
+  ylim.sec  <- range(df[[metric2]], na.rm = TRUE)
+  b <- diff(ylim.prim) / diff(ylim.sec)
+  a <- ylim.prim[1] - b * ylim.sec[1]
+  
+  # 3) Extraer el orden “real” de niveles (tal cual vienen en df, que ya está ordenado)
+  vecOrderedLabels <- df$Level %>% unique()
+  
+  # 4) Graficar
+  df %>%
+    mutate(Level = factor(Level, levels = vecOrderedLabels)) %>%
+    ggplot(aes(x = Level)) +
+      geom_col(aes(y = Exp), fill = "#DEF2F1", color = "black", alpha = .4) +
+      geom_line(aes(y = a + get(metric2) * b, color = "Unsimpl."), group = 1, linetype = "dashed") +
+      geom_point(aes(y = a + get(metric2) * b, color = "Unsimpl.")) +
+      geom_line(aes(y = a + get(metric1) * b, color = "BaseLvl"), group = 1) +
+      geom_point(aes(y = a + get(metric1) * b, color = "BaseLvl")) +
+      scale_y_continuous(name = "Exp",
+                         sec.axis = sec_axis(~ (. - a) / b, name = metric1)) +
+      scale_color_manual(values = c("BaseLvl" = colorLine1,
+                                    "Unsimpl." = colorLine2)) +
+      xlab(factor) +
+      theme_classic() +
+      theme(
+        axis.text.x = element_text(angle = angleXaxis,
+                                   vjust = vjustXaxis,
+                                   hjust = hjustXaxis,
+                                   size = sizeXaxis),
+        legend.position = "bottom",
+        legend.title = element_blank()
+      )
+}
+
+modelPredObsPlotsFinal <- function(dataMetrics, metric1, metric2, factor, colorLine1, colorLine2, sizeXaxis, angleXaxis, vjustXaxis, hjustXaxis){
+  df <- dataMetrics %>% filter(Factor==factor)
+  ylim.prim <- c(0, max(df$Exp, na.rm=TRUE))
+  ylim.sec  <- range(df[[metric2]], na.rm=TRUE)
+  b <- diff(ylim.prim)/diff(ylim.sec); a <- ylim.prim[1]-b*ylim.sec[1]
+labs <- listOrderFactLevels[[factor]]
+  df %>% 
+    mutate(Level=factor(Level,levels=labs)) %>%
+    ggplot(aes(x=Level)) +
+      geom_col(aes(y=Exp), fill="#DEF2F1", color="black", alpha=.4) +
+      geom_line(aes(y=a + get(metric2)*b, color="Pred."), group=1, linetype="dashed") +
+      geom_point(aes(y=a + get(metric2)*b, color="Pred.")) +
+      geom_line(aes(y=a + get(metric1)*b, color="Obs."),   group=1) +
+      geom_point(aes(y=a + get(metric1)*b, color="Obs.")) +
+      scale_y_continuous(name="Exp", sec.axis=sec_axis(~(. - a)/b, name=metric1)) +
+      scale_color_manual(values=c("Obs."=colorLine1,"Pred."=colorLine2)) +
+      xlab(factor) +
+      theme_classic() +
+      theme(
+        axis.text.x  = element_text(angle=angleXaxis, vjust=vjustXaxis, hjust=hjustXaxis, size=sizeXaxis),
+        axis.text    = element_text(size = sizeXaxis + 2),
+        axis.title   = element_text(size = sizeXaxis + 4, face="bold"),
+        legend.position="bottom",
+        legend.title=element_blank()
+      )
+}
+```
+
+
+# 5. Modelización Frecuencia Materiales
+
+## 5.1 Chequeos iniciales 
+
+### Distribucion
+
+
+La repasamos siempre antes de modelizar.
+
+```{r DistribucionFreq, message=FALSE, warning=FALSE}
+
+# Crea la variable frecuencia y muestra histograma 
+dataModel %>% mutate(freqMatRC = NsinMatRC / Exposicion) %>% edaHistCont("freqMatRC")
+```
+
+### Correlaciones entre rating factors
+
+```{r CorrelacionFreqMatRC,fig.width=10, fig.height=8, message=FALSE, warning=FALSE}
+
+# -------- lista de factores del dataModel (excluye target y weight) ----
+factorsList <- names(Filter(is.factor, dataModel))
+
+# -------- función auxiliar V de Cramer -------------------------------
+calc_cramerV <- function(df, v1, v2){
+  cramerV( table(df[[v1]], df[[v2]]) )
+}
+
+# -------- matriz V Cramer -------------------------------------------
+VCramerMat <- outer(factorsList, factorsList,
+                    Vectorize(function(x, y)
+                      ifelse(x == y, 1,
+                             calc_cramerV(dataModel, x, y))))
+dimnames(VCramerMat) <- list(factorsList, factorsList)
+
+# -------- tabla interactiva rápida -----------------------------------
+VCramerMat %>% reactViewTable()
+
+# -------- mapa de calor ------------------
+options(repr.plot.width = 20, repr.plot.height = 12)
+corrplot(VCramerMat,
+         method  = "color",
+         col     = colorRampPalette(c("lightblue","#3AAFA9","darkred"))(100),
+         type    = "lower",
+         order   = "hclust",
+         tl.col  = "black",
+         tl.srt  = 45,
+         tl.cex  = 0.9,
+         addCoef.col = "black",
+         number.cex = 0.9,
+         diag    = FALSE)
+```
+
+**Relaciones encontradas:**
+
+Las variables de vehículo, entre sí, como es lógico. Destacan:
+
+* vehPotencia – vehValor V= 0.51. Colinealidad fuerte: ambos miden, en parte, “tamaño/precio” del coche.
+
+* vehLong - vehPotencia V= 0.49. Alto: los coches más largos suelen necesitar más potencia.
+
+* vehLong - vehValor V= 0.53. Alto: los coches más largos suelen ser más caros.
+
+* vehPuertas – vehLong V= 0.31. Moderada: los coches más largos suelen tener 5 puertas.
+
+
+Además, como era de esperar potencia y peso con la variable creada a partir de ellas. Hay que tener cuidado con estas relaciones a la hora de modelar.
+
+* vehValor – vehValorPot V=0.46. Alto: la ratio €/CV es lógico que dependa del valor absoluto.
+
+* vehPotencia – vehValorPot V= 0.49. Alto: potencia está en el denominador de la ratio.
+
+
+Encontramos tambien una correlación moderada en la variable que decidimos separar en 2.
+
+* polFreqPago – polModoPago V= 0.33. Moderada: el fraccionamiento y la domiciliación suelen ir de la mano.
+
+El resto de pares.
+
+* Resto de pares ≤ 0.25. Sin problema relevante.
+
+Este análisis de correlaciones nos proporciona una visión global de las relaciones entre nuestras variables explicativas. Nos permite identificar posibles redundancias o asociaciones fuertes que podrían generar problemas de multicolinealidad en el modelo. Como resultado, ya podemos anticipar que algunas variables podran no ser incluidas simultáneamente en la estimación final.
+
+## 5.2 Análisis por variables
+
+En esta sección aplicamos las funciones desarrolladas previamente para analizar distintas versiones de los modelos propuestos, centrándonos en el comportamiento de cada variable de forma individual.
+
+### Full Start Model 
+
+Comenzamos con un modelo completo que incluye todos los factores disponibles, con el objetivo de identificar las tendencias generales y evaluar el efecto marginal de cada variable sobre la variable respuesta.
+
+```{r FullStartModelFreq, message=FALSE, warning=FALSE}
+
+## ────────── FULL-START MODEL · FRECUENCIA Daños Materiales ──────────
+
+# 1 · Ajuste completo
+glmFreqFull_Mat <- glm(
+  NsinMatRC ~ condCarne + condScore + polAntiguedad +
+    polFreqPago + polModoPago + geoComunidad +
+    vehPotencia + vehValor + vehCombustible +
+    vehUso + vehClase + vehPuertas + vehLong +
+    vehValorPot,
+  offset = log(Exposicion),
+  family = poisson(),
+  data   = dataModel
+)
+
+# 2 · Vector con TODOS los rating-factors
+fullFactors <- c(
+  "condCarne","condScore","polAntiguedad",
+  "polFreqPago","polModoPago","geoComunidad",
+  "vehPotencia","vehValor","vehCombustible",
+  "vehUso","vehClase","vehPuertas","vehLong",
+  "vehValorPot"
+)
+
+# 3 · Niveles en el mismo orden que definiste en el EDA (dataEda tiene sufijo Fact)
+listOrderFactLevels <- dataEda %>%
+  select(ends_with("Fact")) %>%
+  sapply(levels)
+
+# quitamos el sufijo “Fact” para que coincidan los nombres con los de fullFactors
+names(listOrderFactLevels) <- 
+  names(listOrderFactLevels) %>% str_remove("Fact$")
+
+# 4 · Métricas marginales (sin modelo “sin polinomios”)
+fullMetricsFreq <- ModelAnalysisFinal(
+  model               = glmFreqFull_Mat,
+  modelNoPol          = glmFreqFull_Mat,   # mismo modelo → columnas *NoPol_* quedan NA
+  data                = dataModel,
+  target              = "NsinMatRC",
+  weight              = "Exposicion",
+  vecVars             = fullFactors,
+  listOrderFactLevels = listOrderFactLevels,
+  CompareModels       = FALSE
+)
+
+# 5 · Tabla global
+fullMetricsFreq %>% reactViewTable()
+
+# 6 · Gráficos de tendencias marginales (uno por factor)
+lapply(fullFactors, function(fac){
+  modelAnalysisPlotsFinal(
+    dataMetrics = fullMetricsFreq,
+    metric1     = "RescaledPredictedValues", 
+    metric2     = "RescaledPredictedValues",
+    factor      = fac,
+    colorLine1  = "#00533E",   
+    colorLine2  = "#FFA552",   
+    sizeXaxis   = 8,
+    angleXaxis  = 90, 
+    vjustXaxis  = 0.5, 
+    hjustXaxis  = 1
+  )
+})
+
+```
+
+**Análisis de tendencias:**
+
+* **condCarne** (antigüedad de carnet)
+
+Muy novatos (0 años) presentan la mayor frecuencia relativa. Los valores más altos corresponden con los primeros años 0-5, menos experiencia y sería lógico que fueran conductores más jovenes. A partir de 6 años de experiencia la frecuencia cae bruscamente y se estabiliza en niveles más bajos.Entre 6 y 46 años hay cierta variabilidad (picos puntuales) pero sin una tendencia monotónica clara, parece que ligeramente decreciente con un cierto repunte de la frecuencía a partir de 46 años sin llegar a los valores altos de los primeros años.
+
+* **condScore** (calidad crediticia del conductor)
+
+Partiendo de score 1 (Puntuación Muy buena) como nivel base, el riesgo va aumentando progresivamente hasta score 3, pasando de ≈ 0.29 en 1 a alrededor de 0.32–0.33 en 3. En score 4 el riesgo se desploma (~ 0.29) — muy probablemente por la muy baja exposición en esa categoría. A partir de score 4 el riesgo vuelve a subir, alcanzando su máximo en score 6 (≈ 0.38). Tras el pico en 6, el riesgo baja en score 7 (~ 0.31) y se sitúa en un valor intermedio para “Nuevos” (~ 0.33).
+
+No hay un patrón lineal, pero si que encontramos mayor frecuencia en valoraciones altas (malas calificaciones a excepción del score 4) podría deberse a menor responsabilidad en en este tipo de usuarios. Las categorías con poca exposición (especialmente el score 4) deben interpretarse con mucha cautela, ya que pequeñas fluctuaciones en el numerador o denominador disparan el beta. El hecho de que “Nuevos” quede en un valor de riesgo intermedio refuerza que los conductores sin historial no son ni los más seguros ni los más arriesgados, sino un grupo moderado.
+
+
+* **polAntiguedad** (antigüedad de la póliza)
+
+No hay una tendencia lineal: 1–3 años de antigüedad muestran picos moderados de frecuencia. A partir de 4 años la frecuencia baja notablemente. El grupo “5+” tiene muy poca exposición y riesgo contenido. La ausencia de una relación marginal evidente sugiere que esta variable no aporta información relevante para discriminar el riesgo.
+	
+* **polFreqPago** (frecuencia de pago)
+
+La variable frecuencia de pago parece aportar información relevante sobre el comportamiento del asegurado. En particular, se observa que las pólizas con pagos semestrales presentan un riesgo aproximadamente un 9 % superior en comparación con las de pago anual. Esta diferencia podría estar relacionada con factores como la estabilidad financiera o la capacidad de planificación económica del asegurado. 
+	
+* **polModoPago** (modo de pago)
+
+Efectivo muestra un ligero aumento de frecuencia frente a Domiciliado, aunque la diferencia es pequeña, en torno a un 5%. Quiza el no tener domiciliado el pago puede deberse a mayor irresponsabilidad.
+	
+* **geoComunidad** (comunidad autónoma)
+
+Comunidad de Madrid esta en el punto medio en cuanto a frecuencia,pero es el que realmente tiene exposición, muy por encima del resto.	Cataluña, Andalucía y “RESTO” quedan por encima de Madrid, con leves diferencias entre sí.	Castilla-La Mancha y Comunidad Valenciana aportan poca masa y sus estimaciones son menos fiables.
+
+* **vehPotencia**
+
+Presenta una tendencia creciente en la frecuencia: a mayor potencia, mayor riesgo, especialmente a partir de 125 CV, aunque con menor exposición en los niveles superiores.
+
+* **vehValor**
+
+Muestra una tendencia decreciente: los vehículos de mayor valor económico tienden a tener menor frecuencia de siniestros, lo cual podría estar asociado a perfiles de conductor más prudentes o hábitos de uso diferentes.
+
+* **vehCombustible**
+
+Diesel es el combustible asociado a mayor frecuencia de siniestros.
+Gasolina reduce un 20% el riesgo.
+Otros combustibles aumenta mucho pero con una exposición despreciable.
+
+Parece razonable incluir esta variable, ya que, aunque su efecto no sea del todo intuitivo, el tipo de combustible puede aportar información indirecta sobre aspectos técnicos del vehículo, como su aceleración o características del motor.
+
+* **vehUso**
+
+Aunque la exposición de flotas comerciales es mucho menor que la de uso particular, el modelo asigna un riesgo relativo notablemente mayor a los vehículos comerciales. Esto se ve en la métrica rescalada: los comerciales tienen un 15% más de riesgo. Refuerza la hipótesis de que los clientes con uso profesional tienen una frecuencia de daños materiales superior, probablemente por un mayor kilometraje o un mayor estrés al volante.
+
+* **vehClase** (tipo carrocería)
+
+FAMILIAR es la clase con mayor frecuencia pero la exposición mas baja.
+
+BERLINA (nivel base) queda en rango medio.
+
+OTRO presenta el riesgo más bajo, con una exposición representativa.
+
+	
+* **vehPuertas**
+
+El análisis marginal revela un fuerte desequilibrio en la exposición entre los distintos niveles. La categoría “5+” concentra la gran mayoría de la exposición, mientras que las categorías “4” y “0–3” son minorías con escasa representatividad, lo que dificulta extraer conclusiones robustas. Aunque se observa una frecuencia creciente a medida que disminuye el número de puertas, esta tendencia podría estar influenciada por el bajo volumen de datos en los grupos minoritarios. Tambien podría estar relacionado al uso del vehículo, 3 puertas se suele relacionar más con vehículos comerciales.
+
+
+* **vehLong** (longitud del vehículo)
+
+No sigue una tendencia clara a medida que aumenta la longitud del vehículo. Los vehículos de longitud media (entre 4300 y 4600 mm) presentan la mayor exposición y una frecuencia ligeramente superior, no se observa una relación monotónica entre la longitud y el riesgo. Los vehículos más cortos (<4000 mm) y los más largos (>4600 mm) muestran frecuencias similares, mientras que el grupo de 4000–4300 mm presenta una frecuencia significativamente menor. 
+
+Esta variabilidad sugiere que la longitud del vehículo, por sí sola, no es un factor determinante ni linealmente asociado al riesgo.
+	
+* **vehValorPot** (valor/potencia)
+
+El análisis de la variable vehValorPot revela una tendencia marginal creciente y lineal, donde la frecuencia de siniestros aumenta a medida que lo hace la relación valor/potencia del vehículo. Este comportamiento indica que podría tratarse de un buen discriminador del riesgo, ya que agrupa información técnica relevante del vehículo en una sola métrica.
+
+No obstante, dado que esta variable deriva directamente de vehValor y vehPotencia, que ya están incluidas como variables independientes en el modelo, su incorporación simultánea podría introducir redundancia o problemas de colinealidad. Por tanto, su inclusión deberá evaluarse con cautela, valorando si sustituye o mejora el rendimiento del modelo frente a mantener las variables originales por separado.
+
+
+### Initial Model 
+
+Para la construcción de nuestro modelo inicial de frecuencia de siniestros de daños materiales, hemos seleccionado únicamente aquellas variables que:
+
+* Muestran una tendencia marginal clara y consistente a lo largo de sus niveles (monótonas o con picos interpretables).
+
+* Cuentan con suficiente masa de exposición para que sus estimaciones no queden dominadas por ruido en categorías escasamente pobladas.
+
+* Aportan información distintiva, de forma que cubran distintos ámbitos de comportamiento del asegurado (perfil del conductor, características de la póliza y del vehículo).
+
+Con base en el análisis de tendencias, las variables elegidas son:
+
+  condCarne: ligera señal decreciente con la experiencia, muy alta frecuencia en los primeros años y estabilización posterior.
+  
+  condScore: no lineal, pero claramente discriminativa, con un mínimo local en score 4 y picos en valores altos y “Nuevos”.
+	
+  polFreqPago: semestral vs anual, diferencia de ≈ 9 % en riesgo.
+	
+  geoComunidad: efectos robustos entre Madrid, Cataluña, Andalucía y “RESTO”.
+	
+  vehPotencia: tendencia creciente de frecuencia a medida que aumenta la potencia.
+	
+  vehValor: tendencia decreciente de frecuencia a mayor valor.
+	
+  vehCombustible: Diesel presenta el mayor riesgo, gasolina reduce ≈ 20  %, “Otros” con poca exposición.
+	
+  vehUso (Particular vs Comercial): uso comercial con ≈ 15 % más riesgo, reflejo de mayor kilometraje y estrés.
+  
+  vehClase (tipos de carrocería): FAMILIAR, BERLINA y OTRO muestran diferencias estables y bien pobladas.
+
+Con esta selección buscamos un modelo compacto, que capture los ejes principales de variabilidad del riesgo sin agregar ruido de variables marginales débiles (como polAntiguedad, vehPuertas o vehLong).
+
+```{r InitialModelFreq, message=FALSE, warning=FALSE}
+
+# Initial Model
+glmFreqInitialModel <- glm(NsinMatRC ~ condCarne + condScore + polFreqPago + geoComunidad + vehPotencia + vehValor + vehCombustible + vehUso + vehClase, offset = log(Exposicion), data   = dataModel, family = poisson())
+
+# Vector con los rating-factors incluidos en el modelo inicial
+initialFactors <- c( "condCarne", "condScore", "polFreqPago", "geoComunidad", "vehPotencia", "vehValor", "vehCombustible", "vehUso", "vehClase")
+
+# Cálculo de métricas marginales con ModelAnalysisFinal
+FullDataMetricsFreqInitialModel <- ModelAnalysisFinal(
+  model               = glmFreqInitialModel,
+  modelNoPol          = glmFreqInitialModel,   # same model → NoPol_* columnas quedan NA
+  data                = dataModel,
+  target              = "NsinMatRC",
+  weight              = "Exposicion",
+  vecVars             = initialFactors,
+  listOrderFactLevels = listOrderFactLevels,
+  CompareModels       = FALSE
+)
+
+# Gráficos de tendencias marginales para cada factor
+lapply(1:length(initialFactors), function(i) {
+  modelAnalysisPlotsFinal(
+    dataMetrics = FullDataMetricsFreqInitialModel,
+    metric1     = "RescaledPredictedValues",
+    metric2     = "RescaledPredictedValues",
+    factor      = initialFactors[i],
+    colorLine1  = "#00533E",
+    colorLine2  = "#FFA552",
+    sizeXaxis   = 8,
+    angleXaxis  = 90,
+    vjustXaxis  = 0.5,
+    hjustXaxis  = 1
+  )
+})
+```
+
+En este bloque evaluamos la contribución individual de cada variable al ajuste del Modelo Inicial y exploramos también el impacto de algunas variables adicionales que podrían incorporarse. Para ello, definimos una función que compara dos versiones de un mismo modelo —con y sin un factor concreto— calculando la diferencia en AICc y en devianza, de modo que podamos cuantificar objetivamente la relevancia de cada variable.
+
+
+```{r InitialModelFreqSignificatividad, message=FALSE, warning=FALSE}
+
+## Definimos una función que compara dos GLM que difieren solo en una variable,
+## devolviendo ΔAICc y ΔDevianza.
+
+comparar_modelos_glm <- function(modelo_sin, modelo_con) {
+  n      <- length(modelo_con$y)
+  k_con  <- length(coef(modelo_con))
+  k_sin  <- length(coef(modelo_sin))
+  AICc   <- function(mod, k) {
+    aic <- AIC(mod)
+    aic + (2 * k * (k + 1)) / (n - k - 1)
+  }
+  aicc_con   <- AICc(modelo_con, k_con)
+  aicc_sin   <- AICc(modelo_sin, k_sin)
+  delta_aicc <- aicc_con - aicc_sin
+  dev_con    <- deviance(modelo_con)
+  dev_sin    <- deviance(modelo_sin)
+  delta_dev  <- dev_con - dev_sin
+  
+  resultado <- list(
+    AICc_modelo_con     = aicc_con,
+    AICc_modelo_sin     = aicc_sin,
+    Delta_AICc          = delta_aicc,
+    Devianza_modelo_con = dev_con,
+    Devianza_modelo_sin = dev_sin,
+    Delta_Devianza      = delta_dev
+  )
+  return(resultado)
+}
+
+# 1) Modelos sin cada variable del Modelo Inicial
+listModelsIncluded <- list(
+  condCarne    = update(glmFreqInitialModel, . ~ . - condCarne),
+  condScore    = update(glmFreqInitialModel, . ~ . - condScore),
+  polFreqPago  = update(glmFreqInitialModel, . ~ . - polFreqPago),
+  geoComunidad = update(glmFreqInitialModel, . ~ . - geoComunidad),
+  vehPotencia  = update(glmFreqInitialModel, . ~ . - vehPotencia),
+  vehValor     = update(glmFreqInitialModel, . ~ . - vehValor),
+  vehCombustible = update(glmFreqInitialModel, . ~ . - vehCombustible),
+  vehUso       = update(glmFreqInitialModel, . ~ . - vehUso),
+  vehClase     = update(glmFreqInitialModel, . ~ . - vehClase)
+)
+
+# 2) Comparamos cada modelo reducido con el inicial
+resultStatisticalSigVarInclud <- lapply(
+  names(listModelsIncluded),
+  function(var) {
+    comparar_modelos_glm(listModelsIncluded[[var]], glmFreqInitialModel)
+  }
+) %>%
+  bind_rows() %>%
+  mutate(Variable = names(listModelsIncluded)) %>%
+  relocate(Variable, .before = AICc_modelo_con)
+
+reactViewTable(resultStatisticalSigVarInclud)
+
+# 3) Modelos alternativos con variables no incluidas inicialmente
+listModelsNoIncluded <- list(
+  polAntiguedad = update(glmFreqInitialModel, . ~ . + polAntiguedad),
+  polModoPago   = update(glmFreqInitialModel, . ~ . + polModoPago),
+  vehLong       = update(glmFreqInitialModel, . ~ . + vehLong),
+  vehValorPot   = update(glmFreqInitialModel, . ~ . + vehValorPot)
+)
+
+resultStatisticalSigVarNoInclud <- lapply(
+  names(listModelsNoIncluded),
+  function(var) {
+    comparar_modelos_glm(glmFreqInitialModel, listModelsNoIncluded[[var]])
+  }
+) %>%
+  bind_rows() %>%
+  mutate(Variable = names(listModelsNoIncluded)) %>%
+  relocate(Variable, .before = AICc_modelo_con)
+
+reactViewTable(resultStatisticalSigVarNoInclud)
+```
+<br>
+
+Tras combinar la información del AICc, la devianza y el análisis de tendencias, proponemos las siguientes transformaciones para nuestro Modelo Final, de manera que capturemos la señal más relevante con el menor número posible de parámetros y niveles poco representativos:
+
+* **condCarne:**
+
+  Delta AICc: +13.9 (incluirlo “tal cual” empeora el ajuste)
+	
+  Tendencia: máxima frecuencia en 0–3 años, reducción brusca de 0-10 años, variabilidad sin patrón claro después
+	
+  *Propuesta:* modelarlo con dos polinomios de grado 2, uno para el tramo 0–10 y otro para ≥ 10, de forma que captemos la inflexión inicial y la estabilización posterior.
+  
+<br>
+
+* **condScore:**
+
+  Delta AICc: –213.6 (fuerte mejora)
+	
+  Tendencia: riesgo creciente hasta score 3, caída en score 4 (poca exposición), nuevo pico en 6 y descenso en “Nuevos”
+	
+  *Propuesta:* agrupar niveles en 1–4, 5, 6–7 y “Nuevos”, reduciendo parámetros y suavizando las categorías con muy poca exposición.
+<br>
+	
+* **polFreqPago:**
+
+  Delta AICc: –2.1 (ligera mejora)
+	
+  Tendencia: “Semestral” ≈ 9 % más riesgo que “Anual”
+	
+  *Propuesta:* mantener como variable binaria sin cambios.
+	<br>
+
+* **geoComunidad:**
+
+  Delta AICc: –9.8 (moderada mejora)
+	
+  Tendencia: Madrid y “RESTO” claramente diferenciados; algunas CCAA con muy poca masa
+	
+  *Propuesta:* reducir a tres niveles:“Comunidad de Madrid”, “Castilla‐La Mancha”, “RESTO” (incluye Valenciana y demás)
+	
+* **vehPotencia:**
+
+  Delta AICc: +9.4 (peor ajuste “tal cual”)
+	
+  Tendencia: no lineal, pico en tramos extremos
+	
+  *Propuesta:* agrupar en 4 intervalos lógicos (por ejemplo 0–75, 75–125, 125–200, > 200 CV) o bien un polinomio único de grado 2 si prefieres mantener continuidad.
+	
+* **vehValor:**
+
+  Delta AICc: +17.6 (peor ajuste)
+	
+  Tendencia: claramente decreciente, se estabiliza en tramos altos
+	
+  *Propuesta:* un polinomio de grado 2 hasta 30 000 € y luego agrupar “> 30 000 €” como un solo nivel.
+	
+* **vehCombustible:**
+
+  Delta AICc: –1.6 (mínima mejora)
+	
+  Tendencia: Diesel > Gasolina (–20 %) > Otros (muy poca exposición)
+	
+  *Propuesta:* fusionar “Diesel” y “Otros” vs “Gasolina” para simplificar y mantener la señal.
+	
+* **vehUso:**
+
+  Delta AICc: –3.4 (ligera mejora)
+	
+  Tendencia: Comercial ≈ 15 % más riesgo que Particular
+	
+  *Propuesta:* mantener como binaria.
+	
+* **vehClase:**
+
+  Delta AICc: +2.9 (ligera penalización)
+	
+  Tendencia: FAMILIAR > BERLINA > OTRO
+	
+  *Propuesta:* simplificar a dos niveles fijos: “BERLINA” (base) y “OTRO” (incluye"FAMILIAR").
+	
+	*Variables adicionales*
+	
+* **polAntiguedad** (–38.1): mejora muy notable de AICc; podría incluirse agrupada en 0–3, 4 y “5+”. 
+
+  Como no se ha observado una tendencia marginal clara ni estable en el análisis exploratorio, su efecto puede resultar difícil de aislar o de justificar comercialmente. Por ello, y en línea con una filosofía de modelo parsimonioso y fácilmente explicable, se decide no incluirla en el modelo final, aunque se reconoce su posible valor para análisis futuros o versiones extendidas del modelo.
+	
+* **polModoPago, vehLong, vehValorPot:** aportan muy poca o nula mejora; descartarlas del modelo final.
+
+Con estas simplificaciones, reducimos el número de parámetros y eliminamos niveles con poca masa, al tiempo que capturamos las tendencias clave en cada factor.
+
+
+### Final Model 
+
+A continuación implementamos las recodificaciones y simplificaciones acordadas, primero mediante una función que aplica los cambios sin polinomios y, a continuación, otra que genera las variables numéricas necesarias para los términos polinomiales. 
+
+Posteriormente ajustamos tanto el modelo completo como su versión simplificada con polinomios, obteniendo las métricas y las gráficas de tendencias finales.
+
+```{r FinalModelFreq , message=FALSE, warning=FALSE}
+
+### Final Model
+
+# 1) Función para aplicar recodificaciones sin polinomios
+finalChangesModFreqNoPol <- function(dataModel) {
+  dataModel %>%
+    mutate(
+      condCarneFin = condCarne,
+      
+      condScoreFin = relevel(factor(case_when(
+        condScore %in% c("1","2","3","4") ~ "1-4",
+        condScore == "5"                  ~ "5",
+        condScore %in% c("6","7")         ~ "6-7",
+        condScore == "Nuevos"             ~ "Nuevos"
+      ), levels = c("1-4","5","6-7","Nuevos")), ref = "1-4"),
+      
+      polFreqPagoFin = polFreqPago,
+      
+      geoComunidadFin = relevel(factor(case_when(
+        geoComunidad == "Castilla-La Mancha" ~ "Castilla-La Mancha",
+        geoComunidad == "Comunidad de Madrid" ~ "Comunidad de Madrid",
+        TRUE                                  ~ "Resto"
+      ), levels = c("Castilla-La Mancha","Comunidad de Madrid","Resto")), ref = "Comunidad de Madrid"),
+      
+      vehValorFin = vehValor,
+      
+      vehCombustibleFin = relevel(factor(ifelse(
+        vehCombustible == "Gasolina", "Gasolina", "Diesel-Otros"
+      ), levels = c("Diesel-Otros","Gasolina")), ref = "Diesel-Otros"),
+      
+      vehUsoFin = vehUso,
+      
+      vehClaseFin = relevel(factor(ifelse(
+        vehClase == "BERLINA", "BERLINA", "OTRO"
+      ), levels = c("BERLINA","OTRO")), ref = "BERLINA")
+    )
+}
+
+# 2) Función para crear las variables numéricas de polinomios
+finalChangesModFreqPol <- function(dataModel) {
+ dataModel %>%
+    mutate(
+      # primer tramo: 0–5 → su propio valor, >5 → 5
+      condCarneFinNum1 = as.numeric(case_when(
+        condCarneFin == "0"  ~ 0,
+        condCarneFin == "1"  ~ 1,
+        condCarneFin == "2"  ~ 2,
+        condCarneFin == "3"  ~ 3,
+        condCarneFin == "4"  ~ 4,
+        condCarneFin == "5"  ~ 5,
+        condCarneFin == "6"  ~ 6,
+        condCarneFin == "7"  ~ 7,
+        condCarneFin == "8"  ~ 8,
+        condCarneFin == "9"  ~ 9,
+        condCarneFin == "10" ~ 10,
+        TRUE                 ~ 11
+      )),
+      # segundo tramo: 0–5 → 0, 6–59 → su propio valor, "60+" → 60
+      condCarneFinNum2 = as.numeric(case_when(
+        
+        condCarneFin == "11" ~ 11,
+        condCarneFin == "12" ~ 12,
+        condCarneFin == "13" ~ 13,
+        condCarneFin == "14" ~ 14,
+        condCarneFin == "15" ~ 15,
+        condCarneFin == "16" ~ 16,
+        condCarneFin == "17" ~ 17,
+        condCarneFin == "18" ~ 18,
+        condCarneFin == "19" ~ 19,
+        condCarneFin == "20" ~ 20,
+        condCarneFin == "21" ~ 21,
+        condCarneFin == "22" ~ 22,
+        condCarneFin == "23" ~ 23,
+        condCarneFin == "24" ~ 24,
+        condCarneFin == "25" ~ 25,
+        condCarneFin == "26" ~ 26,
+        condCarneFin == "27" ~ 27,
+        condCarneFin == "28" ~ 28,
+        condCarneFin == "29" ~ 29,
+        condCarneFin == "30" ~ 30,
+        condCarneFin == "31" ~ 31,
+        condCarneFin == "32" ~ 32,
+        condCarneFin == "33" ~ 33,
+        condCarneFin == "34" ~ 34,
+        condCarneFin == "35" ~ 35,
+        condCarneFin == "36" ~ 36,
+        condCarneFin == "37" ~ 37,
+        condCarneFin == "38" ~ 38,
+        condCarneFin == "39" ~ 39,
+        condCarneFin == "40" ~ 40,
+        condCarneFin == "41" ~ 41,
+        condCarneFin == "42" ~ 42,
+        condCarneFin == "43" ~ 43,
+        condCarneFin == "44" ~ 44,
+        condCarneFin == "45" ~ 45,
+        condCarneFin == "46" ~ 46,
+        condCarneFin == "47" ~ 47,
+        condCarneFin == "48" ~ 48,
+        condCarneFin == "49" ~ 49,
+        condCarneFin == "50" ~ 50,
+        condCarneFin == "51" ~ 51,
+        condCarneFin == "52" ~ 52,
+        condCarneFin == "53" ~ 53,
+        condCarneFin == "54" ~ 54,
+        condCarneFin == "55" ~ 55,
+        condCarneFin == "56" ~ 56,
+        condCarneFin == "57" ~ 57,
+        condCarneFin == "58" ~ 58,
+        condCarneFin == "59" ~ 59,
+        condCarneFin == "60+"~ 60,
+        TRUE                 ~ 10
+      )),
+    # mutate(
+    #   # dos segmentos para condCarne (0–5 y 6+)
+    #   condCarneFinNum1 = pmin(as.numeric(condCarneFin), 5),
+    #   condCarneFinNum2 = pmax(as.numeric(condCarneFin) - 6, 0), 
+      # condCarneFinNum1 = as.numeric(ifelse(condCarneFin %in% as.character(0:5), as.numeric(condCarneFin), 5)),
+      # condCarneFinNum2 = as.numeric(ifelse(condCarneFin %in% as.character(6:60), as.numeric(condCarneFin), 6)),
+      
+      # polinomio para vehValor
+      vehValorFinNum = as.numeric(case_when(
+        vehValorFin == "0-10000"      ~  5000,
+        vehValorFin == "10000-12500"  ~ 10000,
+        vehValorFin == "12500-15000"  ~ 12500,
+        vehValorFin == "15000-17500"  ~ 15000,
+        vehValorFin == "17500-20000"  ~ 17500,
+        vehValorFin == "20000-22500"  ~ 20000,
+        vehValorFin == "22500-25000"  ~ 22500,
+        vehValorFin == "25000-30000"  ~ 27500,
+        TRUE                           ~ 30000
+      ))
+    )
+}
+
+# 3) Preparamos dataModel para el modelo final
+dataModelFreqFinal <- dataModel %>%
+  finalChangesModFreqNoPol() %>%
+  finalChangesModFreqPol()
+
+# 4) Ajuste del modelo final
+glmFreqFinalModel <- glm(
+  NsinMatRC ~ condCarneFin +
+               condScoreFin +
+               polFreqPagoFin +
+               geoComunidadFin +
+               vehValorFin +
+               vehCombustibleFin +
+               vehUsoFin +
+               vehClaseFin,
+  offset = log(Exposicion),
+  data   = dataModelFreqFinal,
+  family = poisson()
+)
+
+# 5) Modelo final con polinomios
+glmFreqFinalSimplifiedModel <- glm(
+  NsinMatRC ~ poly(condCarneFinNum1, 2) +
+               poly(condCarneFinNum2, 2) +
+               condScoreFin +
+               polFreqPagoFin +
+               geoComunidadFin +
+               vehValorFinNum +
+               vehCombustibleFin +
+               vehUsoFin +
+               vehClaseFin,
+  offset = log(Exposicion),
+  data   = dataModelFreqFinal,
+  family = poisson()
+)
+
+# 6) Factores finales y niveles
+finalFactors <- c(
+  "condCarneFin","condScoreFin","polFreqPagoFin",
+  "geoComunidadFin","vehValorFin","vehCombustibleFin",
+  "vehUsoFin","vehClaseFin"
+)
+listOrderFactLevels <- list(
+  condCarneFin      = c(as.character(0:59), "60+"),
+  condScoreFin      = c("1-4","5","6-7","Nuevos"),
+  polFreqPagoFin    = c("Semestral","Anual"),
+  geoComunidadFin   = c("Comunidad de Madrid", "Castilla-La Mancha","Resto"),
+  vehValorFin       = c("0-10000","10000-12500","12500-15000","15000-17500",
+                        "17500-20000","20000-22500","22500-25000","25000-30000",
+                        "30000-35000","35000-40000","40000-45000","45000-50000","50000+"),
+  vehCombustibleFin = c("Diesel-Otros","Gasolina"),
+  vehUsoFin         = c("Comercial","Particular"),
+  vehClaseFin       = c("BERLINA","OTRO")
+)
+
+# 7) Métricas y tablas
+FullDataMetricsFreqFinalModelNoPol <- ModelAnalysisFinal(
+  glmFreqFinalModel, glmFreqFinalModel,
+  dataModelFreqFinal, "NsinMatRC", "Exposicion",
+  finalFactors, listOrderFactLevels,
+  funModPol = finalChangesModFreqPol,
+  CompareModels = FALSE
+)
+FullDataMetricsFreqFinalModelNoPol %>% reactViewTable()
+
+FullDataMetricsFreqFinalModel <- ModelAnalysisFinal(
+  glmFreqFinalSimplifiedModel, glmFreqFinalSimplifiedModel,
+  dataModelFreqFinal, "NsinMatRC", "Exposicion",
+  finalFactors, listOrderFactLevels,
+  funModPol = finalChangesModFreqPol,
+  CompareModels = FALSE
+)
+FullDataMetricsFreqFinalModel %>% reactViewTable()
+
+# 8) Gráficos de tendencias finales
+lapply(finalFactors, function(fac) {
+  modelAnalysisPlotsFinal(
+    FullDataMetricsFreqFinalModel,
+    "RescaledPredictedValues", "RescaledPredictedValues",
+    fac, "#00533E", "#FFA552", 8, 90, 0.5, 1
+  )
+})
+
+# Modelos auxiliares para evaluar el impacto de CU (polinomios)
+# Comparación aislada de cada polinomio (1: condCarne, 2: vehValor)
+formulas <- list(
+  # Polinomio en vehValorFinNum, condCarne como factor
+  NsinMatRC ~ condCarneFin + condScoreFin + polFreqPagoFin +
+    geoComunidadFin + poly(vehValorFinNum, 2) +
+    vehCombustibleFin + vehUsoFin + vehClaseFin,
+
+  # Polinomio en condCarneFinNum, vehValor como factor
+  NsinMatRC ~ poly(condCarneFinNum1, 2) + poly(condCarneFinNum2, 2) +
+    condScoreFin + polFreqPagoFin + geoComunidadFin +
+    vehValorFin + vehCombustibleFin + vehUsoFin + vehClaseFin
+)
+
+listCUModelsRev <- lapply(formulas, function(formula) {
+  glm(formula, offset = log(Exposicion), data = dataModelFreqFinal, family = poisson())
+})
+
+listFullDataMetricsFinalModelCUPols <- lapply(1:length(listCUModelsRev), function(i) {
+  ModelAnalysisFinal(
+    glmFreqFinalSimplifiedModel, listCUModelsRev[[i]],
+    dataModelFreqFinal, "NsinMatRC", "Exposicion",
+    finalFactors, listOrderFactLevels,
+    funModPol = finalChangesModFreqPol, CompareModels = TRUE
+  )
+})
+
+# Elegimos los factores que usan CU (polinomios)
+factorsPol <- c("condCarneFin", "vehValorFin")
+
+# Tendencias reescaladas
+lapply(1:length(factorsPol), function(i) {
+  modelAnalysisPlotsFinal(
+    listFullDataMetricsFinalModelCUPols[[i]],
+    "RescaledPredictedValues", "NoPol_RescaledPredictedValues",
+    factorsPol[i], "#00533E", "#FFA552", 8, 90, 0.5, 1
+  )
+})
+
+# Tendencias no reescaladas
+lapply(1:length(factorsPol), function(i) {
+  modelAnalysisPlotsFinal(
+    listFullDataMetricsFinalModelCUPols[[i]],
+    "PredictedValues", "NoPol_PredictedValues",
+    factorsPol[i], "#00533E", "#FFA552", 8, 90, 0.5, 1
+  )
+})
+
+# Comparación Predicho vs Observado para TODOS los factores iniciales
+lapply(1:length(finalFactors), function(i) {
+  modelPredObsPlotsFinal(
+    FullDataMetricsFreqFinalModel,
+    "Obs", "Pred",
+    finalFactors[i], "purple", "darkgreen", 8, 90, 0.5, 1
+  )
+})
+```
+
+Análisis modelo final: 
+
+* **Tendencia marginales**: vemos que las tendencias son lógicas y monótonas, lo cual es fundamental para explicar el modelo y en general la tarifa propuesta. 
+
+* **Ajuste de los polinomios:**
+
+Al superponer la predicción reescalada de los dos segmentos de condCarneFin (0–10 y 10+) frente a la curva sin polinomios, vemos que ambos capturan la caída brusca en los primeros años y la estabilización posterior.
+
+En vehValorFinNum, el polinomio de segundo grado reproduce la ligera tendencia descendente que muestra el factor categórico.
+
+* **AvE**: vemos que el modelo explica bien la realidad sobre la muestra de entrenamiento. 
+
+### Validacion del modelo
+
+Todo lo anterior se ha visto sobre la muestra de entrenamiento, a continuación vamos a testear el modelo sobre la muestra de de validación. 
+
+**Tendencias marginales y AvE**: 
+
+```{r ValidationModelFreq , message=FALSE, warning=FALSE}
+## ────────── VALIDACIÓN MODELO · FRECUENCIA Daños Materiales ──────────
+
+# 1) Preparamos datos de validación con las mismas transformaciones
+dataModelFreqFinalVal <- data %>% 
+  filter(samples == "Validation") %>% 
+  select(-samples) %>% 
+  preprocess() %>% 
+  finalChangesModFreqNoPol() %>% 
+  finalChangesModFreqPol()
+
+# 2) Métricas marginales sobre validación (usamos finalFactors)
+FullDataMetricsFreqFinalModelVal <- ModelAnalysisFinal(
+  glmFreqFinalSimplifiedModel, glmFreqFinalSimplifiedModel,
+  dataModelFreqFinalVal, "NsinMatRC", "Exposicion",
+  finalFactors, listOrderFactLevels,
+  funModPol = finalChangesModFreqPol,
+  CompareModels = FALSE
+)
+
+# 3) Tendencias marginales: entrenamiento vs validación
+listTrainTrend <- lapply(seq_along(finalFactors), function(i) {
+  modelAnalysisPlotsFinal(
+    FullDataMetricsFreqFinalModel,
+    "PredictedValues","PredictedValues",
+    finalFactors[i], "#00533E", "#FFA552",
+    7, 90, 0.5, 1
+  )
+})
+listTestTrend <- lapply(seq_along(finalFactors), function(i) {
+  modelAnalysisPlotsFinal(
+    FullDataMetricsFreqFinalModelVal,
+    "PredictedValues","PredictedValues",
+    finalFactors[i], "#00533E", "#FFA552",
+    7, 90, 0.5, 1
+  )
+})
+
+library(gridExtra)
+for(i in seq_along(listTrainTrend)) {
+  grid.arrange(listTrainTrend[[i]], listTestTrend[[i]], ncol=2)
+}
+
+# 4) AvE (Observed vs Predicted) entrenamiento vs validación
+listTrainAvE <- lapply(seq_along(finalFactors), function(i) {
+  modelPredObsPlotsFinal(
+    FullDataMetricsFreqFinalModel,
+    "Obs","Pred",
+    finalFactors[i], "purple","darkgreen",
+    7, 90, 0.5, 1
+  )
+})
+listTestAvE <- lapply(seq_along(finalFactors), function(i) {
+  modelPredObsPlotsFinal(
+    FullDataMetricsFreqFinalModelVal,
+    "Obs","Pred",
+    finalFactors[i], "purple","darkgreen",
+    7, 90, 0.5, 1
+  )
+})
+
+for(i in seq_along(listTrainAvE)) {
+  grid.arrange(listTrainAvE[[i]], listTestAvE[[i]], ncol=2)
+}
+```
+
+
+Vemos que excepto vehCombustible el resto de variables están bien explicadas sobre la muestra de entrenamiento y la de de validación.
+
+```{r ImpactAnalysisModelFreq, message=FALSE, warning=FALSE}
+
+## ────────── ANÁLISIS DE IMPACTO · FRECUENCIA Daños Materiales ──────────
+
+impactAnalysisPlot <- function(dataMetrics, metric1, metric2, factor, 
+                               colorLine1, colorLine2, 
+                               sizeXaxis, angleXaxis, vjustXaxis, hjustXaxis) {
+
+  # Límites para la métrica principal
+  ylim.prim <- c(0, max(dataMetrics$Weight, na.rm = TRUE))
+  ylim.sec  <- c(min(dataMetrics[[metric1]], na.rm = TRUE),
+                 max(dataMetrics[[metric1]], na.rm = TRUE))
+
+  # Coeficientes de transformación para escalar la métrica 1 y 2
+  b <- diff(ylim.prim) / diff(ylim.sec)
+  a <- ylim.prim[1] - b * ylim.sec[1]
+
+  dataMetrics %>%
+    ggplot() +
+    
+    # Barras de peso (Exposición)
+    geom_col(aes(x = PredictedBands, y = Weight),
+             fill = "yellow", colour = "black", alpha = .4) +
+    
+    # Línea y puntos para Predicción
+    geom_line(aes(x = PredictedBands, y = a + get(metric2) * b, color = "Prediction"),
+              linetype = "dashed", size = .6, group = 1) +
+    geom_point(aes(x = PredictedBands, y = a + get(metric2) * b, color = "Prediction"),
+               size = 2) +
+    
+    # Línea y puntos para Observado
+    geom_line(aes(x = PredictedBands, y = a + get(metric1) * b, color = "Observed"),
+              size = .6, group = 1) +
+    geom_point(aes(x = PredictedBands, y = a + get(metric1) * b, color = "Observed"),
+               size = 2) +
+    
+    # Ejes
+    scale_y_continuous(
+      name = "Weight",
+      sec.axis = sec_axis(~ (. - a) / b, name = "Target")
+    ) +
+    
+    # Colores de leyenda
+    scale_color_manual(values = c("Observed" = colorLine1,
+                                  "Prediction" = colorLine2)) +
+    
+    xlab(factor) +
+    ylab("Weight") +
+    
+    theme_classic() +
+    theme(
+      axis.text.x = element_text(angle = angleXaxis, 
+                                 vjust = vjustXaxis, 
+                                 hjust = hjustXaxis,
+                                 size = sizeXaxis),
+      axis.text   = element_text(size = 12),
+      axis.title  = element_text(size = 14, face = "bold"),
+      legend.position = "bottom",
+      legend.title    = element_blank()
+    )
+}
+
+impactAnalysis <- function(model, data, target, weight, nBands) {
+
+  dataActualPredicted <- data %>%
+    mutate(
+      Actual           = get(target),
+      Weight           = get(weight),
+      Predicted        = predict(model, newdata = mutate(data, !!sym(weight) := 1), type = "response"),
+      PredictedWeighted= Predicted * Weight
+    ) %>%
+    select(Actual, Predicted, PredictedWeighted, Weight)
+
+  # Cortes de exposición
+  peso_total   <- sum(dataActualPredicted$Weight, na.rm = TRUE)
+  puntos_corte <- seq(0, peso_total, length.out = nBands + 1)
+
+  # Asignar banda de predicción
+  dataImpactAnalysis <- dataActualPredicted %>%
+    arrange(Predicted) %>%
+    mutate(PredictedBands = pmin(
+      findInterval(cumsum(Weight), puntos_corte, rightmost.closed=TRUE),
+      nBands - 1        # todo lo que supere nBands-1 lo metemos en la banda nBands-1
+    )) %>%
+    group_by(PredictedBands) %>%
+    summarise(
+      sumActual            = sum(Actual),
+      sumPredictedWeighted = sum(PredictedWeighted),
+      Weight               = sum(Weight),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Actual    = sumActual / Weight,
+      Predicted = sumPredictedWeighted / Weight
+    ) %>%
+    select(PredictedBands, Actual, Predicted, Weight)
+
+  impactAnalysisPlot(dataImpactAnalysis,
+                     "Actual", "Predicted",
+                     "PredictedBands",
+                     "darkred", "darkblue",
+                     7, 90, 0.5, 1)
+}
+
+# Ejecutamos sobre entrenamiento y validación
+impactTrain <- impactAnalysis(
+  glmFreqFinalSimplifiedModel,
+  dataModelFreqFinal,
+  "NsinMatRC", "Exposicion", 30
+)
+
+impactTest  <- impactAnalysis(
+  glmFreqFinalSimplifiedModel,
+  dataModelFreqFinalVal,
+  "NsinMatRC", "Exposicion", 30
+)
+
+grid.arrange(impactTrain, impactTest, ncol = 2)
+```
+
+* En el gráfico de validación destacaba que la última banda (predicted band 30) mostraba un Observado muy alejado de la Predicción. Esto suele ocurrir cuando hay pocas observaciones que caen en ese percentil superior de exposición.Hemos decidido juntar los datos de la ultima barra con la anterior.
+	
+	En términos generales, el modelo se comporta de forma satisfactoria en ambas muestras. Como es habitual, el ajuste sobre la muestra de entrenamiento resulta algo más cercano a los datos reales que en validación, lo que apunta a un leve sobreajuste, aunque no de carácter preocupante dado el grado de coincidencia global de las curvas de Predicción y Observado.
+
+
+# 6. Modelización Severidad Materiales
+
+## 6.1 Chequeos iniciales 
+
+### Distribución
+
+```{r DistribucionSev, message=FALSE, warning=FALSE}
+
+# Severidad Daños Materiales
+# Creamos la variable de severidad como la relación CsinMatRC/NsinMatRC
+dataModel %>%
+  mutate(sevMatRC = CsinMatRC / NsinMatRC) %>%
+  filter(NsinMatRC > 0) %>%
+  edaDensityNum("sevMatRC", 8000)
+```
+
+Dado que el modelo de coste medio se construye únicamente a partir de los registros que han presentado siniestro, es necesario repetir el análisis de correlaciones entre variables explicativas. Al trabajar con una submuestra diferente del dataset original, pueden surgir correlaciones nuevas que no se manifestaban en el análisis previo de frecuencia, o desaparecer algunas existentes, debido a los cambios en la masa estadística. Este análisis permite anticipar posibles problemas de colinealidad en el modelo de severidad y guiar una selección más robusta de variables.
+
+### Correlaciones
+
+
+```{r CorrelacionSev,fig.width=10, fig.height=8, message=FALSE, warning=FALSE}
+
+
+# 1) Filtrar solo los registros con al menos un siniestro material
+dataModelSev <- dataModel %>% 
+  filter(NsinMatRC > 0)
+
+# 2) Extraer nombres de las variables factor
+factorsList <- get_names(dataModelSev, types = c('factor'))
+
+# 3) Construir matriz vacía para almacenar la V de Cramer
+VCramerSevMatrix <- matrix(
+  NA, 
+  nrow = length(factorsList), 
+  ncol = length(factorsList), 
+  dimnames = list(factorsList, factorsList)
+)
+
+# 4) Rellenar la matriz: 1 en la diagonal, V de Cramer en el resto
+VCramerSevMatrix[] <- sapply(factorsList, function(var1) {
+  sapply(factorsList, function(var2) {
+    if (var1 != var2) {
+      calc_cramerV(dataModelSev, var1, var2)
+    } else {
+      1
+    }
+  })
+})
+
+# 5) Mostrar la tabla de correlaciones
+VCramerSevMatrix %>% reactViewTable()
+
+# 6) Dibujar el correlograma
+corrplot(
+  VCramerSevMatrix, 
+  method       = "color", 
+  col          = colorRampPalette(c("lightblue","#3AAFA9","darkred"))(100), 
+  type         = "lower", 
+  order        = "hclust", 
+  addCoef.col  = "black", 
+  tl.col       = "black", 
+  tl.srt       = 45, 
+  tl.cex       = 0.9, 
+  number.cex   = 0.9, 
+  diag         = FALSE
+)
+
+```
+
+Relaciones encontradas:
+
+* Variables técnicas del vehículo
+	
+	Se confirma un agrupamiento fuerte entre las características técnicas: vehPotencia, vehValor y vehLong muestran V de Cramer muy elevadas (≈ 0.48 – 0.52), reflejando que los coches más potentes tienden también a ser de mayor valor y longitud.
+	
+	vehValorPot (valor/potencia) se correlaciona con vehValor (0.46) y en menor medida con vehPot (0.19), lo que tiene sentido dado que mezcla esas dos dimensiones.
+	
+  
+  Dentro del componente “tipo de vehículo”, vehClase, vehPuertas y vehUso aparecen con correlaciones moderadas (0.32 entre clase y uso; 0.36 entre uso y puertas), indicando perfiles de carrocería y número de puertas que se asocian a un uso comercial o particular.
+
+* Variables de póliza
+		
+	polFreqPago y polModoPago mantienen una V de Cramer de 0.31, evidenciando que quien elige un tipo de frecuencia de pago tiende también a preferir un modo (domiciliado vs. efectivo).
+	
+	polAntiguedad presenta correlaciones muy bajas (≤ 0.08) con el resto de factores, lo que sugiere independencia respecto al perfil del vehículo o del conductor en el sub-conjunto con siniestros.
+
+* Perfil del conductor
+	
+	condCarne y condScore se asocian débil-moderadamente (0.23), mostrando que los conductores con más años de carnet tienden a tener también cierto patrón en su score crediticio.
+	
+	El resto de cruces entre edad, score y comunidad autónoma son débiles (V < 0.23), lo que indica que, en severidad, el perfil demográfico añade poca colinealidad.
+	
+* Comentario general
+	
+	Al trabajar solo con los ≈ 2000 casos que tuvieron reclamación (frente a los ≈ 20 000 de frecuencia), algunas V de Cramer pueden inflarse por bajo recuento de niveles.Es clave mantener vigilancia de colinealidad especialmente entre las variables técnicas del vehículo, pues en severidad sus relaciones son incluso más fuertes que en frecuencia.
+
+## 6.2 Análisis por variables
+
+Para severidad hay que tener presente que se debe usar el conjunto de datos sólo con las observaciones con siniestro, base de datos que hemos filtrado en el apartado anterior.
+
+### Full Start Model 
+
+```{r FullModelSev, message=FALSE, warning=FALSE}
+
+# ────────── FULL SEVERITY MODEL · Costo Medio de Daños Materiales ──────────
+
+# 1) Mostramos un vistazo de los datos de severidad (solo casos con siniestro)
+dataModelSev %>% 
+  select(where(is.factor)) %>%
+  head(1000) %>% 
+  reactViewTable()
+
+
+# 2) Ajuste del modelo “full” de severidad (Gamma log-link, ponderado por número de siniestros)
+glmSevFullModel <- glm(
+  CsinMatRC / NsinMatRC ~ 
+    condCarne   + condScore    + polAntiguedad + polFreqPago + polModoPago + geoComunidad +
+    vehPotencia + vehValor     + vehCombustible + vehUso     + vehClase    +
+    vehPuertas  + vehLong      + vehValorPot,
+  weights = NsinMatRC,
+  family  = Gamma(link = "log"),
+  data    = dataModelSev
+)
+
+# 3) Definimos el vector de factores incluidos
+fullFactorsSev <- c(
+  "condCarne","condScore","polAntiguedad","polFreqPago", "polModoPago", "geoComunidad",
+  "vehPotencia","vehValor","vehCombustible","vehUso","vehClase",
+  "vehPuertas","vehLong","vehValorPot"
+)
+
+# 4) Recuperamos los niveles en el mismo orden que en el EDA
+listOrderFactLevelsSev <- dataEda %>% select(ends_with("Fact")) %>% sapply(levels)
+names(listOrderFactLevelsSev) <- names(listOrderFactLevelsSev) %>% str_remove("Fact$")
+
+# 5) Calculamos efectos marginales reescalados y estadísticas observadas vs. predichas
+FullDataMetricsSevFullModel <- ModelAnalysisFinal(
+  model               = glmSevFullModel,
+  modelNoPol          = glmSevFullModel,    # mismo modelo → columnas NoPol_* quedan NA
+  data                = dataModelSev,
+  target              = "CsinMatRC",
+  weight              = "NsinMatRC",
+  vecVars             = fullFactorsSev,
+  listOrderFactLevels = listOrderFactLevelsSev,
+  CompareModels       = FALSE
+)
+
+# 6) Tabla de resultados global
+FullDataMetricsSevFullModel %>% reactViewTable()
+
+# 7) Gráficos de tendencias marginales (uno por factor)
+
+lapply(1:length(fullFactorsSev), function(i){modelAnalysisPlotsFinal(FullDataMetricsSevFullModel, "RescaledPredictedValues", "RescaledPredictedValues",fullFactorsSev[i], "#00533E", "#FFA552", 8, 90, 0.5, 1)})
+
+
+```
+
+* condCarne (antigüedad de carnet)
+
+La severidad no muestra un patrón monótono. Los conductores con 0–1 años de experiencia presentan costes medios moderados; a partir de 2–3 años la severidad alcanza un primer pico y luego se atenúa, estabilizándose en torno a un nivel base. Hay un ligero repunte en la segunda mitad de la escala (años muy altos), pero con exposiciones muy bajas, por lo que conviene interpretar esos puntos con cautela.
+
+* condScore (calidad crediticia del conductor)
+
+En los niveles 1 a 3, donde se concentra la mayor exposición, el coste medio predicho es bajo y bastante estable, lo que confirma que los perfiles con mejor solvencia presentan siniestros de menor coste medio.
+A partir del nivel 4, se observa un aumento claro y sostenido del coste medio, con un pico especialmente alto en el nivel 7, que corresponde a los perfiles con mayor riesgo crediticio. El grupo de clientes nuevos, presenta también un coste medio elevado, superior al de los niveles 1 a 3, lo cual podría estar relacionado con la incertidumbre o falta de información crediticia.
+
+La variable muestra un comportamiento marginal coherente con su significado, con un patrón general ascendente en el coste medio a medida que empeora la calidad crediticia. A pesar de la exposición desigual —con poca masa estadística en los niveles 4 a 7 y en “Nuevos”—, la tendencia respalda su inclusión en el modelo de severidad, probablemente agrupando niveles para mayor estabilidad en la estimación.
+
+* polAntiguedad (antigüedad de la póliza)
+
+La variable no presenta una relación marginal coherente ni estable con el coste medio. La ausencia de una tendencia consistente y la variabilidad inexplicable entre años cercanos sugieren que su valor predictivo en el modelo de severidad es limitado. Aunque se podría considerar una agrupación de niveles (por ejemplo, “0–3”, “4”, “5+”), no se justifica claramente su inclusión, salvo que mejore significativamente los indicadores globales del modelo (AIC, devianza) o ayude en la estabilidad de otras variables.
+
+* polFreqPago (frecuencia de pago)
+
+Las pólizas con frecuencia de pago anual muestran un coste medio superior en comparación con las semestrales (≈5 %).
+
+Este patrón podría interpretarse desde un enfoque de comportamiento: asegurados que optan por pagos anuales podrían estar asociados a perfiles más estables económicamente, que además podrían estar vinculados a vehículos de mayor valor asegurado, lo cual incrementa el coste medio en caso de siniestro.
+
+La variable presenta un comportamiento marginal estable y con sentido técnico, por lo que se considera apropiada para su inclusión en el modelo de severidad. Aporta una segmentación sencilla que puede estar captando diferencias en perfil de riesgo o capacidad de pago, sin añadir complejidad excesiva al modelo.
+
+* polModoPago (modo de pago)
+
+Las pólizas con pago domiciliado presentan un coste medio superior al de las pólizas pagadas en efectivo. Esta tendencia es coherente con el perfil del asegurado, ya que quienes optan por domiciliación suelen tener mayor estabilidad financiera y podrían estar vinculados a vehículos de mayor valor.
+Sin embargo, esta variable aparece correlacionada con polFreqPago, tal como se observó en el análisis de correlaciones (por ejemplo, muchos pagos anuales tienden a estar domiciliados).
+
+Aunque polModoPago presenta una tendencia marginal clara, su correlación con polFreqPago y su probable rol redundante dentro del modelo hacen recomendable incluir solo una de las dos. 
+
+* geoComunidad (comunidad autónoma)
+
+La distribución de la exposición es altamente desigual, con la Comunidad de Madrid acumulando la mayor parte de los datos. Los valores extremos del coste medio en comunidades con muy poca exposición deben interpretarse con cautela, ya que pueden estar influenciados por pocos siniestros de importe alto.
+
+Por tanto, puede ser interesante su inclusión en el modelo tras una recategorización adecuada (por ejemplo, Madrid, Castilla-La Mancha, y Resto)., especialmente si mejora las métricas globales sin introducir inestabilidad.
+
+* vehPotencia
+
+La variable vehPotencia muestra un comportamiento no lineal y con cierta irregularidad en su relación con el coste medio predicho.
+Entre 75 y 125 CV, donde se concentra la mayor exposición, los valores predichos son moderados y estables, lo que aporta confianza en estos niveles. A partir de 125 CV, los valores fluctúan de forma más marcada, con un pico en el grupo 175–200 CV, lo que podría estar asociado a vehículos de gama alta o de prestaciones especiales.
+
+* vehValor
+
+Tendencia general ascendente con el valor del vehículo, pero muy irregular en niveles altos por baja exposición.
+Recomendación: Aporta valor explicativo pero requiere agrupación de tramos. Incluir con simplificación o sustituir por una variable derivada (vehValorPot).
+
+* vehCombustible
+	
+Se observa una tendencia ascendente del coste medio desde vehículos diésel hacia gasolina y otros combustibles. Aunque coherente, la baja exposición del grupo “Otros” puede distorsionar resultados.
+Podemos valorar si agrupar "Gasolina" y "Otros".
+	
+* vehUso
+
+Coste medio ligeramente mayor en vehículos comerciales, aunque sin diferencias amplias. Buena masa en ambos grupos.
+Es una variable sencilla, estable y útil para segmentación básica. Candidata razonable para el modelo inicial.
+
+* vehClase (tipo de carrocería)
+	
+	La clase “FAMILIAR” muestra el coste medio más bajo, pero su exposición es muy reducida, lo que puede restar fiabilidad al valor estimado. Los grupos “BERLINA” y “OTRO” presentan mayor exposición y un coste medio más elevado, siendo BERLINA el más alto. Puede ser una variable útil, fusionaríamos "FAMILIAR" y "OTRO" ya que "FAMILIAR" tiene muy poca masa estadística.
+
+* vehPuertas
+
+Patrones poco consistentes y fuerte desequilibrio en exposición (el grupo 5+ domina).
+A priori, escasa capacidad explicativa. Puede descartarse y optar por otras variables que están relacionadas como vehClase o vehUso si se quiere capturar el estilo del vehículo.
+
+* vehLong (longitud del vehículo)
+
+No presenta una tendencia clara. El grupo 4300–4600 mm tiene el valor más alto.Evitaremos incluirla junto a vehPotencia o vehValor por su alta correlación. Si se elige una variable de tamaño o prestaciones, esta no sería la preferida.
+
+* vehValorPot (valor / potencia)
+
+Tendencia clara y decreciente: los vehículos con mejor ratio valor/potencia presentan menor coste medio. 
+Parece buena alternativa compacta para sustituir a vehValor y vehPotencia si se busca evitar colinealidad y mantener capacidad predictiva.Decidiremos entre una de estas tres variables.
+
+### Initial Model  
+
+Aunque el modelo completo del paso anterior nos sirvió para explorar tendencias marginales y detectar posibles relaciones, no podemos otorgarle demasiada credibilidad a sus conclusiones. Incluir todas las variables de forma simultánea solo resulta útil si existe suficiente exposición en todos los niveles, algo que no siempre se cumple en el caso de la severidad.
+
+Por ello, en este modelo inicial seleccionamos únicamente aquellos factores que han demostrado una tendencia coherente y una capacidad explicativa estable, evitando además colinealidades innecesarias. Las variables incluidas en este primer modelo son:
+condScore, polModoPago, geoComunidad, vehValor, vehUso, vehClase, vehCombustible.
+
+Este conjunto de variables nos permite construir un modelo interpretativo y suficientemente robusto como punto de partida, sobre el que posteriormente testaremos otras variables descartadas o transformaciones adicionales.
+
+```{r InitialModelSev, message=FALSE, warning=FALSE}
+
+# ────────── INITIAL SEVERITY MODEL · Costo Medio de Daños Materiales ──────────
+
+# 1) Ajuste del modelo inicial con las variables seleccionadas
+glmSevInitialModel <- glm(
+  CsinMatRC / NsinMatRC ~ 
+    condScore    + 
+    polModoPago  + 
+    geoComunidad + 
+    vehValor     + 
+    vehUso       + 
+    vehClase     + 
+    vehCombustible,
+  weights = NsinMatRC,
+  family  = Gamma(link = "log"),
+  data    = dataModelSev
+)
+
+# 2) Factores incluidos en este modelo inicial
+initialFactorsSev <- c("condScore", "polModoPago", "geoComunidad", "vehValor", "vehUso", "vehClase", "vehCombustible")
+
+# 3) Métricas marginales reescaladas
+FullDataMetricsSevInitialModel <- ModelAnalysisFinal(
+  model               = glmSevInitialModel,
+  modelNoPol          = glmSevInitialModel,   # mismo modelo → NoPol_* quedan NA
+  data                = dataModelSev,
+  target              = "CsinMatRC",
+  weight              = "NsinMatRC",
+  vecVars             = initialFactorsSev,
+  listOrderFactLevels = listOrderFactLevelsSev,
+  CompareModels       = FALSE
+)
+
+# 4) Gráficos de tendencias marginales
+lapply(initialFactorsSev, function(fac) {
+  modelAnalysisPlotsFinal(
+    dataMetrics = FullDataMetricsSevInitialModel,
+    metric1     = "RescaledPredictedValues",
+    metric2     = "RescaledPredictedValues",
+    factor      = fac,
+    colorLine1  = "#00533E",
+    colorLine2  = "#FFA552",
+    sizeXaxis   = 7,
+    angleXaxis  = 90,
+    vjustXaxis  = 0.5,
+    hjustXaxis  = 1
+  )
+})
+```
+
+Y para evaluar la significatividad de cada variable incluida:
+
+```{r}
+# ────────── Comparación de variables · Severidad ──────────
+
+# 0) Función para comparar modelos (la misma que usaste en frecuencia)
+comparar_modelos_glm <- function(modelo_sin, modelo_con) {
+  n      <- length(modelo_con$y)
+  k_con  <- length(coef(modelo_con))
+  k_sin  <- length(coef(modelo_sin))
+  AICc   <- function(mod, k) {
+    aic <- AIC(mod)
+    aic + (2 * k * (k + 1)) / (n - k - 1)
+  }
+  aicc_con   <- AICc(modelo_con, k_con)
+  aicc_sin   <- AICc(modelo_sin, k_sin)
+  delta_aicc <- aicc_con - aicc_sin
+  dev_con    <- deviance(modelo_con)
+  dev_sin    <- deviance(modelo_sin)
+  delta_dev  <- dev_con - dev_sin
+  
+  resultado <- list(
+    AICc_modelo_con     = aicc_con,
+    AICc_modelo_sin     = aicc_sin,
+    Delta_AICc          = delta_aicc,
+    Devianza_modelo_con = dev_con,
+    Devianza_modelo_sin = dev_sin,
+    Delta_Devianza      = delta_dev
+  )
+  return(resultado)
+}
+
+# 1) Modelos sin cada variable del modelo inicial
+listModelsIncluded <- list(
+  condScore      = update(glmSevInitialModel, . ~ . - condScore),
+  polModoPago    = update(glmSevInitialModel, . ~ . - polModoPago),
+  geoComunidad   = update(glmSevInitialModel, . ~ . - geoComunidad),
+  vehValor       = update(glmSevInitialModel, . ~ . - vehValor),
+  vehUso         = update(glmSevInitialModel, . ~ . - vehUso),
+  vehClase       = update(glmSevInitialModel, . ~ . - vehClase),
+  vehCombustible = update(glmSevInitialModel, . ~ . - vehCombustible)
+)
+
+# 2) Resultados de variables incluidas
+resultStatisticalSigSevIncluded <- lapply(
+  names(listModelsIncluded),
+  function(var) {
+    comparar_modelos_glm(listModelsIncluded[[var]], glmSevInitialModel)
+  }
+) %>%
+  bind_rows() %>%
+  mutate(Variable = names(listModelsIncluded)) %>%
+  relocate(Variable, .before = AICc_modelo_con)
+
+reactViewTable(resultStatisticalSigSevIncluded)
+
+# 3) Modelos añadiendo variables no incluidas inicialmente
+listModelsNoIncluded <- list(
+  condCarne     = update(glmSevInitialModel, . ~ . + condCarne),
+  polFreqPago   = update(glmSevInitialModel, . ~ . + polFreqPago),
+  polAntiguedad = update(glmSevInitialModel, . ~ . + polAntiguedad),
+  vehPotencia   = update(glmSevInitialModel, . ~ . + vehPotencia),
+  vehLong       = update(glmSevInitialModel, . ~ . + vehLong),
+  vehValorPot   = update(glmSevInitialModel, . ~ . + vehValorPot),
+  vehPuertas    = update(glmSevInitialModel, . ~ . + vehPuertas)
+)
+
+# 4) Resultados de variables no incluidas
+resultStatisticalSigSevNotIncluded <- lapply(
+  names(listModelsNoIncluded),
+  function(var) {
+    comparar_modelos_glm(glmSevInitialModel, listModelsNoIncluded[[var]])
+  }
+) %>%
+  bind_rows() %>%
+  mutate(Variable = names(listModelsNoIncluded)) %>%
+  relocate(Variable, .before = AICc_modelo_con)
+
+reactViewTable(resultStatisticalSigSevNotIncluded)
+```
+
+
+
+
+Propuesta de simplificación:
+
+* **condScore**:
+
+Agrupamos en tres niveles:
+* “Bueno” (scores 1–3)
+* “Medio-Alto” (scores 4–7)
+* “Nuevos”
+1–3 son muy estables y de bajo coste medio; 4–7 presentan un riesgo creciente y “Nuevos” queda en un nivel intermedio.
+
+
+* **polFreqPago**
+Finalmente se sustituye **polModoPago** en el modelo final por **polFreqPago**. En un paso posterior se observo:
+
+La gráfica Obs vs Pred de polModoPagoFin mostraba un sesgo invertido en validación (el nivel con mayor exposición se predecía sistemáticamente al alza o a la baja).
+
+Al sustituir por polFreqPagoFin, ese sesgo desaparece, y la curva de predicción sigue de forma fiel la realidad, reduciendo tanto la desviación absoluta media como el error de calibración entre Training y Test.
+
+  * Se mantienen para **polFreqPago**  los niveles (“Semestral” vs “Anual”).
+
+	
+* **geoComunidad**
+
+Reducimos a tres categorías:
+
+* Madrid
+* Cataluña
+* Resto (el conjunto de todas las demás, incluida Comunidad Valenciana,Andalucía, C. la Mancha y RESTO)
+	Madrid, Cataluña tienen suficiente exposición cada una y un coste medio razonable, el resto las agrupamos.
+
+* **vehValor**
+
+Dado el ruido en tramos extremos (baja exposición) y para facilitar el ajuste, proponemos reducir los niveles agrupando de forma semántica:
+
+* "0-15000",
+* "15000-22500",
+* "22500-30000",
+* "30000+"
+
+Nos hemos decidido por esta variable frente a vehPotencia y vehValorPotencia para el modelo final.
+
+* **vehUso:**
+
+La eliminamos del modelo final, ya que tanto el análisis gráfico de tendencias como los resultados de devianza y AICc indican que no aporta capacidad explicativa significativa.
+
+* **vehClase**
+
+se mantiene en el modelo con su codificación actual. 
+
+(Se ha evaluado una posible agrupación de niveles para simplificar la variable, pero esta opción resultó en una pérdida de ajuste, tanto en términos de capacidad predictiva como de estabilidad del modelo. Por tanto, se conserva la estructura original, que ofrece un mejor comportamiento marginal y un ajuste más preciso a los datos observados.	
+
+
+* **vehCombustible:**
+
+Se va a eliminar del modelo final, en un principio se había incluido en el modelo, con agrupación:
+
+* “Diesel”
+* “No‐Diesel” (Gasolina + Otros)
+
+Hemos visto:
+
+* En entrenamiento, el coste medio (predicho y observado) es mayor para No-Diesel.
+* En validación, ocurre justo lo contrario: el coste medio es mayor para Diesel.
+
+Como esto genera un problema de inestabilidad en la predicción, porque el modelo ha aprendido una relación que no se sostiene al aplicar en nuevos datos y viendo los gráficos y sabiendo que además:
+
+* el efecto de la variable es leve,
+
+* la predicción es incoherente entre training y validation,
+
+* y el AIC tampoco la respalda con fuerza…
+	
+Hemos decidido crear de nuevo el modelo sin esta variable.
+
+```{r FinalModelSev, message=FALSE, warning=FALSE}
+# Final Model (sin vehCombustibleFin)
+
+finalChangesModSevNoPol <- function(dataModel) {
+  dataModelSevFinal <- dataModel %>%
+    mutate(
+      condScoreFin = relevel(factor(case_when(
+        condScore %in% c("1", "2", "3") ~ "Bueno",
+        condScore %in% c("4", "5", "6", "7") ~ "Medio-Bajo",
+        condScore == "Nuevos" ~ "Nuevos"
+      ), levels = c("Bueno", "Medio-Bajo", "Nuevos")), ref = "Bueno"),
+
+      polFreqPagoFin = polFreqPago,
+      
+      geoComunidadFin = relevel(factor(case_when(
+        geoComunidad == "Comunidad de Madrid" ~ "Madrid",
+        geoComunidad == "Cataluña"            ~ "Cataluña",
+        TRUE                                  ~ "Resto"), 
+        levels = c("Madrid", "Cataluña", "Resto")), ref = "Madrid"),
+
+      vehValorFin = relevel(factor(case_when(
+        vehValor %in% c("0-10000", "10000-12500", "12500-15000") ~ "0-15000",
+        vehValor %in% c("15000-17500", "17500-20000", "20000-22500") ~ "15000-22500",
+        vehValor %in% c("22500-25000", "25000-30000") ~ "22500-30000",
+        TRUE ~ "30000+"
+      ), levels = c("0-15000", "15000-22500", "22500-30000", "30000+")), ref = "15000-22500"),
+
+      vehClaseFin = vehClase
+    )
+
+  return(dataModelSevFinal)
+}
+
+dataModelSevFinal <- finalChangesModSevNoPol(dataModelSev)
+
+# Ajuste del modelo final (sin vehCombustibleFin)
+glmSevFinalModel <- glm(
+  CsinMatRC / NsinMatRC ~ condScoreFin + polFreqPagoFin + geoComunidadFin + vehValorFin + vehClaseFin,
+  weights = NsinMatRC,
+  data    = dataModelSevFinal,
+  family  = Gamma(link = "log")
+)
+
+# Definición de factores
+finalFullFactors <- get_names(dataModelSevFinal %>% select(contains("Fin")), types = c("factor"))
+finalFactors <- c("condScoreFin", "polFreqPagoFin", "geoComunidadFin", "vehValorFin", "vehClaseFin")
+
+# Orden de niveles
+listOrderFactLevels <- list(
+  condScoreFin = c("Bueno", "Medio-Bajo", "Nuevos"),
+  polFreqPagoFin = c("Semestral", "Anual"),
+  geoComunidadFin = c("Madrid", "Cataluña", "Resto"),
+  vehValorFin = c("0-15000", "15000-22500", "22500-30000", "30000+"),
+  vehClaseFin = c("BERLINA", "FAMILIAR", "OTRO")
+)
+
+# Evaluación del modelo
+FullDataMetricsSevFinalModel <- ModelAnalysisFinal(
+  glmSevFinalModel, glmSevFinalModel,
+  dataModelSevFinal, "CsinMatRC", "NsinMatRC",
+  finalFullFactors, listOrderFactLevels,
+  CompareModels = FALSE
+)
+
+FullDataMetricsSevFinalModel %>% reactViewTable()
+
+# Gráficos de tendencias
+lapply(1:length(finalFactors), function(i) {
+  modelAnalysisPlotsFinal(
+    FullDataMetricsSevFinalModel,
+    "RescaledPredictedValues", "RescaledPredictedValues",
+    finalFactors[i], "#00533E", "#FFA552", 7, 90, 0.5, 1
+  )
+})
+
+# Predicho vs Observado
+lapply(1:length(finalFullFactors), function(i) {
+  modelPredObsPlotsFinal(
+    FullDataMetricsSevFinalModel,
+    "Obs", "Pred",
+    finalFullFactors[i], "purple", "darkgreen", 7, 90, 0.5, 1
+  )
+})
+```
+
+### Validacion del modelo
+
+**Tendencias**
+
+```{r ValidationModelSev, message=FALSE, warning=FALSE}
+
+# ────────── VALIDACIÓN DEL MODELO FINAL · Severidad ──────────
+
+# 1) Preprocesado del conjunto de validación
+dataModelSevFinalVal <- preprocess(
+  data %>%
+    filter(samples == "Validation") %>%
+    filter(NsinMatRC > 0) %>%
+    select(-samples)
+) %>%
+  finalChangesModSevNoPol
+
+# 2) Evaluación en validación
+FullDataMetricsSevFinalModelVal <- ModelAnalysisFinal(
+  glmSevFinalModel, glmSevFinalModel,
+  dataModelSevFinalVal, "CsinMatRC", "NsinMatRC",
+  finalFullFactors, listOrderFactLevels,
+  CompareModels = FALSE
+)
+
+# 3) Tendencias marginales (Train vs Test)
+listTrainTrend <- lapply(1:length(finalFactors), function(i) {
+  modelAnalysisPlotsFinal(
+    FullDataMetricsSevFinalModel, "PredictedValues", "PredictedValues",
+    finalFactors[i], "#00533E", "#FFA552", 7, 90, 0.5, 1)
+})
+
+listTestTrend <- lapply(1:length(finalFactors), function(i) {
+  modelAnalysisPlotsFinal(
+    FullDataMetricsSevFinalModelVal, "PredictedValues", "PredictedValues",
+    finalFactors[i], "#00533E", "#FFA552", 7, 90, 0.5, 1)
+})
+
+for (i in seq_along(listTrainTrend)) {
+  grid.arrange(listTrainTrend[[i]], listTestTrend[[i]], ncol = 2)
+}
+
+# 4) Predicción vs Realidad (Train vs Test)
+listTrainAvE <- lapply(1:length(finalFullFactors), function(i) {
+  modelPredObsPlotsFinal(
+    FullDataMetricsSevFinalModel, "Obs", "Pred",
+    finalFullFactors[i], "purple", "darkgreen", 7, 90, 0.5, 1)
+})
+
+listTestAvE <- lapply(1:length(finalFullFactors), function(i) {
+  modelPredObsPlotsFinal(
+    FullDataMetricsSevFinalModelVal, "Obs", "Pred",
+    finalFullFactors[i], "purple", "darkgreen", 7, 90, 0.5, 1)
+})
+
+for (i in seq_along(listTrainAvE)) {
+  grid.arrange(listTrainAvE[[i]], listTestAvE[[i]], ncol = 2)
+}
+```
+
+**Análisis del modelo final de severidad:**
+
+  * Tendencias marginales:
+	
+Las variables seleccionadas muestran comportamientos coherentes con su interpretación técnica, especialmente condScoreFin y vehValorFin, donde se observa una relación monótona y con sentido entre los niveles y el coste medio predicho. Sin embargo, la escasa exposición en varios niveles (por ejemplo, en vehCombustibleFin o geoComunidadFin) limita la estabilidad de algunas estimaciones marginales.
+
+  *	Ajuste global y capacidad predictiva:
+	
+El modelo captura adecuadamente las diferencias entre segmentos relevantes, aunque en algunas variables (como vehClaseFin o geoComunidadFin) se evidencian desviaciones notables entre valores observados y predichos, especialmente en niveles con baja masa estadística.
+
+  * Error medio (AvE):
+	
+Se detecta un mayor grado de error medio respecto al modelo de frecuencia, algo habitual en coberturas con menor volumen de siniestros como los daños materiales. Este efecto es especialmente visible en niveles poco representados, donde el modelo tiende a infra o sobreestimar el coste medio.
+
+  * Parsimonia del modelo:
+	
+Se ha priorizado mantener un modelo compacto con solo cinco variables, eliminando aquellas que no aportaban valor significativo según los criterios de AICc, devianza y análisis gráfico. Esta decisión busca mejorar la interpretabilidad sin comprometer en exceso la capacidad explicativa.
+
+  * Colinealidad controlada:
+
+Se ha evitado introducir variables redundantes (como vehPotencia, vehLongitud o vehUso), priorizando aquellas que concentran mejor la información (por ejemplo, vehValorFin). Esto ha contribuido a reducir el riesgo de colinealidad en el modelo.
+
+
+**Análisis de impacto**
+
+```{r impactAnalysisSev, message=FALSE, warning=FALSE}
+
+# 1) Impacto en entrenamiento
+impactTrainSev <- impactAnalysis(
+  model        = glmSevFinalModel,
+  data         = dataModelSevFinal,
+  target       = "CsinMatRC",
+  weight       = "NsinMatRC",
+  nBands       = 15
+)
+
+# 2) Impacto en validación
+impactTestSev  <- impactAnalysis(
+  model        = glmSevFinalModel,
+  data         = dataModelSevFinalVal,
+  target       = "CsinMatRC",
+  weight       = "NsinMatRC",
+  nBands       = 15
+)
+
+# 3) Mostrar ambos gráficos lado a lado
+grid.arrange(impactTrainSev, impactTestSev, ncol = 2)
+
+```
+
+En conjunto, el modelo de severidad se comporta correctamente: discrimina bien entre segmentos de bajo y alto coste, y mantiene la tendencia aprendida durante el entrenamiento cuando se aplica a datos nuevos.
+
+# 7. Cálculo de la prima pura
+
+Para calcular la prima pura simulamos el uso de nuestros modelos sobre datos “futuros” aplicando primero el mismo preprocesado inicial (limpieza, imputación y creación de variables) y, a continuación, las transformaciones finales (recodificaciones y polinomios) que definimos durante la modelización. De este modo, las predicciones de frecuencia y severidad se obtienen sobre un conjunto de datos tratado de forma idéntica al de desarrollo, garantizando la coherencia del resultado.
+
+```{r calcPruras, message=FALSE, warning=FALSE}
+
+# ────────── Cálculo de la prima pura ──────────
+
+PurePremiumData <- data.frame(
+  Frecuencia = predict(
+    glmFreqFinalSimplifiedModel,
+    newdata = preprocess(data) %>% 
+      # aplicamos el preprocesado y las recodificaciones finales de frecuencia
+      finalChangesModFreqNoPol() %>% 
+      finalChangesModFreqPol() %>% 
+      # forzamos Exposicion = 1 para obtener tasa por unidad
+      mutate(Exposicion = 1),
+    type = "response"
+  ),
+  Severidad = predict(
+    glmSevFinalModel,
+    newdata = preprocess(data) %>% 
+      # aplicamos el preprocesado inicial y las recodificaciones finales de severidad
+      finalChangesModSevNoPol(),
+    type = "response"
+  )
+) %>%
+  # prima pura = frecuencia * severidad
+  mutate(PrimaPura = Frecuencia * Severidad)
+
+# Vista previa de las primeras filas
+PurePremiumData %>% head(1000) %>% reactViewTable()
+```
+<br>
+
+**Conclusión del caso práctico:**
+
+Tras una breve exploración de los datos, obtenemos como resultados un proceso de modelización que nos permite capturar de forma coherente tanto la frecuencia como la severidad de los daños materiales, y, a partir de ambos, estimar la prima pura para cada póliza. En concreto:
+
+* Modelo de Frecuencia: empleamos un GLM Poisson con enlace logarítmico, donde variables como el condScore, la frecuencia de pago y características del vehículo mostraron tendencias marginales lógicas. La validación confirmó que las predicciones de siniestros se ajustan bien a los datos observados, sin signos de sobreajuste significativo.
+
+
+* Modelo de Severidad: adoptamos un GLM Gamma con enlace logarítmico, incorporando variables seleccionadas. Los efectos marginales reflejaron patrones esperables de coste medio según perfil de asegurado y vehículo, y la validación mostró una buena concordancia entre la cuantía media predicha y la real.
+
+
+* Prima Pura: el producto de ambas predicciones genera un rango de primas puras que, para la gran mayoría de pólizas, se sitúa en un intervalo razonable (entre 60 € y 150 €), con picos más elevados donde existe mayor riesgo combinado. Este cálculo encaja con el comportamiento siniestral de la cartera y sienta una base sólida para la estrategia tarifaria comercial.
+
+En conjunto, estos resultados ofrecen un punto de partida técnico robusto para el departamento de Pricing & Analytics: un modelo sencillo de interpretar, con variables explicativas bien justificadas y validado en datos de prueba, que permitirá derivar tarifas ajustadas al riesgo real de cada asegurado.
+
+# 8. Información de la sesión
+
+En favor de la replicabilidad: 
+
+```{r message = FALSE, warning=FALSE}
+
+sessionInfo()
+
+```
