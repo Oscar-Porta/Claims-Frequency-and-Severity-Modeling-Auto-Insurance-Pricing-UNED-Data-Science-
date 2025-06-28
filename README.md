@@ -1,5 +1,3 @@
-# Claims-Frequency-and-Severity-Modeling-Auto-Insurance-Pricing-UNED-Data-Science-
-Applied modeling project focused on estimating claim frequency and severity for third-party material damages in car insurance. Includes data cleaning, EDA, predictive modeling with GLMs, and pure premium calculation.
 # Claims Frequency and Severity Modeling – Auto Insurance Pricing (UNED Data Science)
 
 This repository contains an applied data science project focused on modeling insurance claims for a Spanish non-life insurance company. It was developed as part of Module 7 – Big Data in the Insurance Sector, within the Master’s program in Big Data and Data Science Applied to Economics and Business (UNED, 2024–2025).
